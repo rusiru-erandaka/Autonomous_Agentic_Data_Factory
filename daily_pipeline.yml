@@ -1,0 +1,69 @@
+# .github/workflows/daily_pipeline.yml
+#
+# Runs the dataset pipeline every day at 2:00 AM UTC.
+# Also allows manual trigger from the GitHub Actions tab.
+#
+# Required secrets (set in repo Settings → Secrets → Actions):
+#   OPENROUTER_API_KEY  — your OpenRouter API key
+#   HF_TOKEN            — HuggingFace write token
+#   GH_PAT              — GitHub Personal Access Token (read:repo scope)
+
+name: Daily Dataset Pipeline
+
+on:
+  schedule:
+    - cron: '0 2 * * *'   # every day at 02:00 UTC
+  workflow_dispatch:        # manual trigger from GitHub UI
+    inputs:
+      task_target:
+        description: 'Number of tasks to generate (default 50)'
+        required: false
+        default: '50'
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120     # 2 hour hard limit
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Create registry directory
+        run: mkdir -p pipeline/registry
+
+      - name: Run pipeline
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          HF_TOKEN:           ${{ secrets.HF_TOKEN }}
+          GITHUB_TOKEN:       ${{ secrets.GH_PAT }}
+          HF_DATASET_REPO:    ${{ vars.HF_DATASET_REPO }}
+          DAILY_TASK_TARGET:  ${{ github.event.inputs.task_target || '50' }}
+          RUN_ONCE:           "true"
+        working-directory: pipeline
+        run: python main.py
+
+      - name: Upload run logs as artifact
+        if: always()   # upload even if pipeline had errors
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-logs-${{ github.run_number }}
+          path: pipeline/registry/run_*.json
+          retention-days: 30
+
+      - name: Upload local batch backup
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: batch-backup-${{ github.run_number }}
+          path: pipeline/registry/batch_*.jsonl
+          retention-days: 30

@@ -1,0 +1,12 @@
+{
+  "date": "2026-04-08",
+  "tasks_generated": 0,
+  "traces_captured": 0,
+  "traces_labeled": 0,
+  "records_passed": 0,
+  "drift_detected": false,
+  "errors": [
+    "Pipeline error: OPENROUTER_API_KEY is not set."
+  ],
+  "duration_seconds": 0.0
+}
