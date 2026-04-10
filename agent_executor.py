@@ -128,7 +128,7 @@ def simulate_tool_call(tool_name: str, tool_input: dict) -> dict:
     return response
 
 
-def run_agent_on_task(task: dict, max_steps: int = 10) -> dict:
+def run_agent_on_task(task: dict, max_steps: int = 4) -> dict:
     """
     Run the ReAct agent on a single task.
     Returns a complete trace dict ready for labeling.
@@ -154,12 +154,12 @@ def run_agent_on_task(task: dict, max_steps: int = 10) -> dict:
             "agent",
             messages,
             temperature=0.4,
-            max_tokens=1024,
+            max_tokens=512,
         )
 
         if raw is None:
             # Try backup model
-            raw = call_llm("agent_backup", messages, temperature=0.4, max_tokens=1024)
+            raw = call_llm("agent_backup", messages, temperature=0.4, max_tokens=512)
 
         if raw is None:
             failure_reason = "model_unavailable"
@@ -293,8 +293,7 @@ def execute_tasks(tasks: list[dict]) -> list[dict]:
         except Exception as e:
             print(f"  ❌ Task execution failed: {e}")
 
-        # Small delay between tasks to respect rate limits
-        time.sleep(2)
+        # Global rate limiter in openrouter_client handles spacing
 
     success_count = sum(1 for t in traces if t["outcome"]["status"] == "success")
     partial_count = sum(1 for t in traces if t["outcome"]["status"] == "partial")

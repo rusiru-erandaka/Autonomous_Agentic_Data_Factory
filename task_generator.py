@@ -373,10 +373,10 @@ def passes_rule_based_check(task: dict) -> bool:
 
 # Daily budget breakdown
 DAILY_BUDGET = {
-    "template_based":  40,
-    "llm_generative":  35,
-    "mutation_based":  25,
-}
+    "template_based":  10,
+    "llm_generative":  10,
+    "mutation_based":  10,
+}  # 30 tasks × 4 steps = ~120 agent LLM calls — fits free tier
 
 def generate_tasks(total: int = 100) -> list[dict]:
     """

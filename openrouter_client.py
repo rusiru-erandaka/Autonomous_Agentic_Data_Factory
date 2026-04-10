@@ -18,11 +18,11 @@ BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 # ── Model assignments ──────────────────────────────────────────────────────────
 MODELS = {
-    "agent":        "meta-llama/llama-3.3-70b-instruct:free",   # agent executor
-    "agent_backup": "openai/gpt-oss-120b:free",                  # fallback executor
-    "labeler":      "nvidia/nemotron-3-super-120b-a12b:free",    # primary labeler
+    "agent":        "nvidia/nemotron-3-super-120b-a12b:free",   # agent executor
+    "agent_backup": "google/gemma-4-31b-it:free",                # fallback executor
+    "labeler":      "arcee-ai/trinity-large-preview:free",    # primary labeler
     "secondary":    "qwen/qwen3-next-80b-a3b-instruct:free",     # secondary labeler
-    "generator":    "meta-llama/llama-3.3-70b-instruct:free",    # task generator (same as agent — reliable text model)
+    "generator":    "google/gemma-4-26b-a4b-it:free",            # task generator (separate model)
     "quality_gate": "nvidia/nemotron-nano-9b-v2:free",           # quality checker
 }
 
