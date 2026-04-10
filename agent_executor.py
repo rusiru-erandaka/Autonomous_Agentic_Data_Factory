@@ -282,6 +282,8 @@ def execute_tasks(tasks: list[dict]) -> list[dict]:
     total  = len(tasks)
 
     print(f"\n🤖 Executing {total} tasks with ReAct agent...")
+    print("  ⏳ Waiting 60s before starting — letting rate limit window reset...")
+    time.sleep(60)
     for i, task in enumerate(tasks, 1):
         print(f"  [{i}/{total}] {task['task'][:70]}...")
         try:

@@ -13,7 +13,7 @@ import json
 import requests
 from typing import Optional
 
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "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")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "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")
 BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 # ── Model assignments ──────────────────────────────────────────────────────────
@@ -27,16 +27,17 @@ MODELS = {
 }
 
 # ── Rate limit config ──────────────────────────────────────────────────────────
-# OpenRouter free tier = ~20 requests/minute TOTAL across ALL models.
-# 4s gap between every call = max 15 req/min, safely under the limit.
-MIN_SECONDS_BETWEEN_CALLS = 4.0
-RATE_LIMIT_WAIT           = 65
-MAX_RETRIES               = 4
-RETRY_BACKOFF             = [2, 5, 15, 30]
-
+# OpenRouter free tier real-world limit: ~6-10 req/min per account.
+# 10s gap = max 6 req/min — conservative but reliable.
+# When a 429 hits, wait 120s (2 min) to let the window fully reset.
+MIN_SECONDS_BETWEEN_CALLS = 10.0
+RATE_LIMIT_WAIT           = 120
+MAX_RETRIES               = 3
+RETRY_BACKOFF             = [5, 15, 30]
+ 
 _last_call_time: float = 0.0
-
-
+ 
+ 
 def _enforce_rate_limit():
     """Sleep until MIN_SECONDS_BETWEEN_CALLS have passed since the last call."""
     global _last_call_time
@@ -45,8 +46,8 @@ def _enforce_rate_limit():
     if gap > 0:
         time.sleep(gap)
     _last_call_time = time.time()
-
-
+ 
+ 
 def call_llm(
     role: str,
     messages: list,
@@ -61,18 +62,18 @@ def call_llm(
     """
     if not OPENROUTER_API_KEY:
         raise EnvironmentError("OPENROUTER_API_KEY is not set.")
-
+ 
     model = MODELS.get(role)
     if not model:
         raise ValueError(f"Unknown role '{role}'. Valid roles: {list(MODELS.keys())}")
-
+ 
     if json_mode:
         messages = messages.copy()
         messages[-1]["content"] += (
             "\n\nIMPORTANT: Return ONLY valid JSON. "
             "No markdown fences, no explanation, no extra text."
         )
-
+ 
     payload = {
         "model":       model,
         "messages":    messages,
@@ -85,32 +86,38 @@ def call_llm(
         "HTTP-Referer":  "https://github.com/your-username/agent-behavior-dataset",
         "X-Title":       "Agent Behavior Dataset Pipeline",
     }
-
+ 
     for attempt in range(retries):
         # Enforce global rate limit before every single request
         _enforce_rate_limit()
-
+ 
         try:
             response = requests.post(
                 BASE_URL, headers=headers, json=payload, timeout=120
             )
-
+ 
             # ── 429: rate limit hit despite our throttle — wait and retry ─────
             if response.status_code == 429:
-                print(f"  ⚠️  429 on '{role}' — waiting {RATE_LIMIT_WAIT}s...")
-                time.sleep(RATE_LIMIT_WAIT)
+                # Print headers so we can see the real limit
+                rl_limit     = response.headers.get("X-RateLimit-Limit", "unknown")
+                rl_remaining = response.headers.get("X-RateLimit-Remaining", "unknown")
+                rl_reset     = response.headers.get("X-RateLimit-Reset", "unknown")
+                retry_after  = response.headers.get("Retry-After", RATE_LIMIT_WAIT)
+                wait         = int(retry_after) + 5 if str(retry_after).isdigit() else RATE_LIMIT_WAIT
+                print(f"  ⚠️  429 on '{role}' | limit={rl_limit} remaining={rl_remaining} reset={rl_reset} | waiting {wait}s...")
+                time.sleep(wait)
                 continue
-
+ 
             # ── 503: model temporarily unavailable ────────────────────────────
             if response.status_code == 503:
                 wait = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
                 print(f"  ⚠️  503 model unavailable — retrying in {wait}s...")
                 time.sleep(wait)
                 continue
-
+ 
             response.raise_for_status()
             data = response.json()
-
+ 
             # ── Safely extract content ─────────────────────────────────────────
             # Some models return None content or omit the field entirely.
             # Never call .strip() directly on data["choices"][0]["message"]["content"]
@@ -121,10 +128,10 @@ def call_llm(
                 wait = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
                 time.sleep(wait)
                 continue
-
+ 
             message = choices[0].get("message") or {}
             content = message.get("content")
-
+ 
             if content is None:
                 # Model returned null content — happens when it hits its own
                 # content filter or returns a tool_call block instead of text.
@@ -133,23 +140,23 @@ def call_llm(
                 wait = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
                 time.sleep(wait)
                 continue
-
+ 
             return content.strip()
-
+ 
         except requests.exceptions.Timeout:
             wait = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
             print(f"  ⚠️  Timeout (attempt {attempt+1}) — retrying in {wait}s...")
             time.sleep(wait)
-
+ 
         except Exception as e:
             wait = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
             print(f"  ❌ Attempt {attempt+1} error: {e} — retrying in {wait}s...")
             time.sleep(wait)
-
+ 
     print(f"  ❌ All {retries} attempts failed for role '{role}'.")
     return None
-
-
+ 
+ 
 def call_llm_json(role: str, messages: list, **kwargs) -> Optional[dict]:
     """
     Wrapper around call_llm with json_mode=True that auto-parses the result.
@@ -176,8 +183,8 @@ def call_llm_json(role: str, messages: list, **kwargs) -> Optional[dict]:
             return salvaged
         print(f"  ❌ JSON parse error: {e} | Raw preview: {raw[:300]}")
         return None
-
-
+ 
+ 
 def repair_truncated_json(raw: str) -> Optional[list]:
     """
     Attempt to salvage a truncated JSON array.
@@ -186,15 +193,15 @@ def repair_truncated_json(raw: str) -> Optional[list]:
     Returns a list of valid objects, or None if nothing salvageable.
     """
     raw = raw.strip()
-
+ 
     # Only attempt repair on arrays
     if not raw.startswith("["):
         return None
-
+ 
     salvaged = []
     depth    = 0
     start    = None
-
+ 
     for i, ch in enumerate(raw):
         if ch == "{":
             if depth == 0:
@@ -211,5 +218,5 @@ def repair_truncated_json(raw: str) -> Optional[list]:
                 except json.JSONDecodeError:
                     pass
                 start = None
-
+ 
     return salvaged if salvaged else None
