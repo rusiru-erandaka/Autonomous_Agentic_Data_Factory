@@ -13,7 +13,7 @@ import json
 import requests
 from typing import Optional
 
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "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")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "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")
 BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 # ── Model assignments ──────────────────────────────────────────────────────────
@@ -26,11 +26,13 @@ MODELS = {
     "quality_gate": "nvidia/nemotron-nano-9b-v2:free",           # quality checker
 }
 
-# ── Rate limit config ──────────────────────────────────────────────────────────
-# OpenRouter free tier real-world limit: ~6-10 req/min per account.
-# 10s gap = max 6 req/min — conservative but reliable.
-# When a 429 hits, wait 120s (2 min) to let the window fully reset.
-MIN_SECONDS_BETWEEN_CALLS = 10.0
+# # ── Rate limit config ──────────────────────────────────────────────────────────
+# OpenRouter free tier hard limits:
+#   - 50 req/day  (without credits)
+#   - 1000 req/day (with $10 credits purchased)
+#   - 20 req/min always
+# 6s gap = 10 req/min — safely under the per-minute limit.
+MIN_SECONDS_BETWEEN_CALLS = 6.0
 RATE_LIMIT_WAIT           = 120
 MAX_RETRIES               = 3
 RETRY_BACKOFF             = [5, 15, 30]

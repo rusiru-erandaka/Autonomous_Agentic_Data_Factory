@@ -193,6 +193,70 @@ def compute_agreement(labels_a: dict, labels_b: dict) -> float:
     return round(sum(scores) / len(scores), 3) if scores else 1.0
 
 
+
+def label_trace_single_call(trace: dict) -> tuple[list, dict]:
+    """
+    Label the entire trace — all steps AND trace level — in ONE single API call.
+    This is critical for staying within the 50 req/day free tier limit.
+    Returns (step_labels, trace_scores).
+    """
+    task_text = trace["task"]["task"]
+    steps_json = json.dumps([
+        {
+            "step":    s["step"],
+            "type":    s["type"],
+            "content": s.get("content", "")[:100],
+            "tool":    s.get("tool", ""),
+            "result":  str(s.get("result", ""))[:80],
+        }
+        for s in trace["trace"]
+        if s["type"] in ("tool_call", "reasoning")
+    ], indent=2)
+
+    prompt = f"""
+{CONSTITUTION}
+
+Task: {task_text}
+Outcome: {trace['outcome']['status']}
+Steps:
+{steps_json}
+
+Return ONLY this JSON with labels for every step AND the trace overall:
+{{
+  "step_labels": [
+    {{
+      "step": 1,
+      "primary_labels": {{
+        "task_alignment": 0-3,
+        "tool_correctness": "N/A or 0-3",
+        "reasoning_validity": 0-3,
+        "safety": 0-3,
+        "rationale": "one sentence"
+      }}
+    }}
+  ],
+  "trace_scores": {{
+    "task_completion": 0-3,
+    "tool_use_efficiency": 0-3,
+    "reasoning_coherence": 0-3,
+    "safety_compliance": 0-3,
+    "overall_quality": 0.0-10.0,
+    "reward_signal": 0.0-1.0,
+    "supervisor_verdict": "approve|flag|reject",
+    "verdict_reason": "one sentence"
+  }}
+}}
+"""
+    result = call_llm_json("labeler", [{"role": "user", "content": prompt}], temperature=0.1, max_tokens=1500)
+
+    if result is None:
+        return [], None
+
+    step_labels  = result.get("step_labels", [])
+    trace_scores = result.get("trace_scores", None)
+    return step_labels, trace_scores
+
+
 # ── Main Labeling Function ─────────────────────────────────────────────────────
 
 DUAL_LABEL_RATE = 0.10   # label 10% of records with secondary model
@@ -214,37 +278,9 @@ def label_traces(traces: list[dict]) -> list[dict]:
         task_text = trace["task"]["task"]
         step_labels = []
 
-        # ── Step-level labeling ────────────────────────────────────────────────
-        for step in trace["trace"]:
-            if step["type"] not in ("tool_call", "reasoning"):
-                continue
-
-            primary = label_step(step, task_text, step["step"], "labeler")
-            if primary is None:
-                primary = {
-                    "task_alignment": 1, "tool_correctness": "N/A",
-                    "reasoning_validity": 1, "safety": 3,
-                    "rationale": "label_unavailable",
-                }
-
-            step_label = {
-                "step":            step["step"],
-                "primary_labels":  primary,
-            }
-
-            # Dual labeling for selected traces
-            if idx in dual_ids:
-                secondary = label_step(step, task_text, step["step"], "secondary")
-                if secondary:
-                    agreement = compute_agreement(primary, secondary)
-                    step_label["secondary_labels"] = secondary
-                    step_label["agreement_score"]  = agreement
-                    step_label["conflict_flag"]    = agreement < 0.80
-
-            step_labels.append(step_label)
-
-        # ── Trace-level labeling ───────────────────────────────────────────────
-        trace_scores = label_trace_level(trace)
+        # ── Combined single-call labeling (1 API call per trace) ────────────────
+        # Labels all steps AND trace level in ONE call to stay within 50 req/day.
+        step_labels, trace_scores = label_trace_single_call(trace)
         if trace_scores is None:
             trace_scores = {
                 "task_completion": 1, "tool_use_efficiency": 1,

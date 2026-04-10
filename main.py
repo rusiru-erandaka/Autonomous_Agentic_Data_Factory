@@ -19,7 +19,7 @@ from quality_gate import filter_valid, check_label_drift
 from hf_uploader import push_to_hf
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-DAILY_TASK_TARGET = int(os.environ.get("DAILY_TASK_TARGET", "10"))   # start small
+DAILY_TASK_TARGET = int(os.environ.get("DAILY_TASK_TARGET", "5"))    # 5 tasks = ~40 API calls, fits free 50 req/day limit
 RUN_ONCE          = os.environ.get("RUN_ONCE", "false").lower() == "true"
 SCHEDULE_TIME     = os.environ.get("SCHEDULE_TIME", "02:00")         # UTC
 
