@@ -13,7 +13,7 @@ import json
 import requests
 from typing import Optional
 
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "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")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "YOUR_OPENROUTER_API_KEY")
 BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 # ── Model assignments ──────────────────────────────────────────────────────────
