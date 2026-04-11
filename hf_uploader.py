@@ -9,8 +9,8 @@ import json
 import pandas as pd
 from datetime import datetime
 
-HF_TOKEN       = os.environ.get("HF_TOKEN", "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")
-DATASET_REPO   = os.environ.get("HF_DATASET_REPO", "Rusiru-erandaka/oche_agent_dataset")
+HF_TOKEN       = os.environ.get("HF_TOKEN", "Huggingface_Token")
+DATASET_REPO   = os.environ.get("HF_DATASET_REPO", "YOUR_REPO_NAME")
 
 
 def flatten_record(record: dict) -> dict:
