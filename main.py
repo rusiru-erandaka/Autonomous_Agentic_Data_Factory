@@ -7,6 +7,29 @@ Scheduled:     GitHub Actions runs this every day at 2am UTC
 
 import os
 import sys
+
+# ── Load .env file FIRST before any other imports read env vars ───────────────
+def _load_env():
+    env_path = os.path.join(os.path.dirname(__file__), ".env")
+    if not os.path.exists(env_path):
+        print("⚠️  No .env file found. Create one from .env.example")
+        return
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            # Handle both: export KEY="val" and KEY="val"
+            line = line.removeprefix("export").strip()
+            if "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            val = val.strip().strip('"\'\'')
+            os.environ.setdefault(key.strip(), val)
+    print("✅ .env loaded")
+
+_load_env()
+
 import time
 import json
 import schedule

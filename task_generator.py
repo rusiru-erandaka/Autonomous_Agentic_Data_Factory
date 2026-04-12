@@ -94,7 +94,9 @@ def generate_template_tasks(count: int = 40) -> list[dict]:
 
 BATCH_SIZE = 3   # used by mutation batching only
 
-# ── Rule-based signal → task conversion (zero LLM calls) ─────────────────────
+# ── LLM-based signal → task conversion ───────────────────────────────────────
+# Uses the generator model (gemma) to convert real signals into clean tasks.
+# Batches 3 signals per call to stay within rate limits.
 # Map source keywords to tools and difficulty
 SOURCE_TOOL_MAP = {
     "stripe":     (["stripe_api", "api_fetch"],         "medium"),
@@ -131,11 +133,77 @@ TASK_PATTERNS = [
     "Investigate and resolve: {title}. Document the root cause and fix.",
 ]
 
+def convert_signal_to_task(signal: dict) -> Optional[dict]:
+    """
+    Convert a raw real-world signal into a clean agent task using LLM.
+    Single signal per call to keep output tokens low and avoid truncation.
+    """
+    prompt = f"""Convert this real-world developer signal into an AI agent task.
+
+Signal ({signal['source']}):
+{signal['raw_text'][:200]}
+
+Rules: requires 2+ tool calls, fits API Orchestration or Code Agent niche, solvable by AI agent.
+If irrelevant return null.
+
+Return ONLY JSON (or null):
+{{
+  "task": "one sentence executable agent task",
+  "difficulty": "simple|medium|complex",
+  "expected_tools": ["tool1", "tool2"],
+  "likely_failure_points": ["point1"],
+  "generation_strategy": "llm_generative",
+  "freshness_source": "{signal['source']}"
+}}"""
+    return call_llm_json("generator", [{"role": "user", "content": prompt}], max_tokens=300)
+
+
+def convert_signals_llm(signals: list[dict]) -> list[dict]:
+    """
+    Convert a batch of real-world signals into clean agent tasks using LLM.
+    Batches BATCH_SIZE signals per call to respect rate limits.
+    """
+    from openrouter_client import call_llm_json
+
+    numbered = ""
+    for i, s in enumerate(signals):
+        numbered += f"\n--- Signal {i+1} (source: {s['source']}) ---\n{s['raw_text'][:200]}\n"
+
+    prompt = f"""You are a task designer for an AI agent behavior dataset.
+Convert each signal below into a clean, executable agent task.
+Focus on API Orchestration and Code Agent tasks.
+
+{numbered}
+
+Rules:
+- Each task needs at least 2 tool calls
+- Must have at least one realistic failure point
+- Return null for irrelevant signals
+
+Return ONLY a JSON array with exactly {len(signals)} items:
+[
+  {{
+    "task": "one or two sentence agent task",
+    "difficulty": "simple|medium|complex",
+    "expected_tools": ["tool1", "tool2"],
+    "likely_failure_points": ["point1"],
+    "generation_strategy": "llm_generative",
+    "freshness_source": "source_here"
+  }}
+]"""
+
+    result = call_llm_json("generator", [{"role": "user", "content": prompt}], max_tokens=1200)
+    if isinstance(result, dict):
+        result = [result]
+    if not isinstance(result, list):
+        return []
+    return [r for r in result if r and isinstance(r, dict) and r.get("task")]
+
+
 def convert_signal_rule_based(signal: dict) -> dict:
-    """
-    Convert a raw signal to a task using pure string matching — zero LLM calls.
-    Extracts service name, picks matching tools/difficulty/failures, fills a template.
-    """
+    """Fallback rule-based converter used if LLM call fails."""
+def convert_signal_rule_based(signal: dict) -> dict:
+    """Fallback: rule-based conversion if LLM call fails."""
     import re
     text   = (signal["raw_text"] or "").lower()
     source = (signal["source"] or "").lower()
@@ -369,14 +437,64 @@ def passes_rule_based_check(task: dict) -> bool:
 
 
 
+def mutate_tasks_llm(seed_tasks: list[dict]) -> list[dict]:
+    """Mutate a batch of tasks using LLM to create harder, more diverse variants."""
+    from openrouter_client import call_llm_json
+
+    mutations = [
+        "Add a mid-task failure that requires recovery (e.g. 429 rate limit, auth error).",
+        "Add input validation requirement — agent must handle malformed or missing fields.",
+        "Expand into 2-agent coordination: one fetches data, one writes output.",
+        "Add idempotency requirement — running twice must not create duplicates.",
+        "Add a logging + notification requirement on completion or failure.",
+    ]
+
+    numbered = ""
+    chosen   = []
+    for i, seed in enumerate(seed_tasks):
+        m = random.choice(mutations)
+        chosen.append(m)
+        numbered += f"\n--- Task {i+1} ---\nOriginal: {seed['task']}\nMutation: {m}\n"
+
+    prompt = f"""Mutate each agent task below to create a harder, more diverse variant.
+Apply the specified mutation to each one.
+
+{numbered}
+
+Return ONLY a JSON array with exactly {len(seed_tasks)} items:
+[
+  {{
+    "task": "mutated task description",
+    "difficulty": "complex",
+    "expected_tools": ["tool1", "tool2"],
+    "likely_failure_points": ["point1"],
+    "generation_strategy": "mutation_based",
+    "freshness_source": "mutation_of_existing"
+  }}
+]"""
+
+    result = call_llm_json("generator", [{"role": "user", "content": prompt}], max_tokens=1200)
+    if isinstance(result, dict):
+        result = [result]
+    if not isinstance(result, list):
+        return []
+    return [r for r in result if r and isinstance(r, dict) and r.get("task")]
+
+
 # ── Main Generate Function ─────────────────────────────────────────────────────
 
 # Daily budget breakdown
 DAILY_BUDGET = {
-    "template_based":  6,
-    "llm_generative":  5,
-    "mutation_based":  4,
-}  # 15 tasks × 4 steps + 15 labels = ~80 req/day, fits 3-key 150 req/day budget
+    "template_based":  4,    # 0 LLM calls (pure template)
+    "llm_generative":  4,    # 4 LLM calls (generator model)
+    "mutation_based":  4,    # 4 LLM calls (generator model)
+}
+# Total call budget breakdown (3 keys = 150 req/day):
+#   task generation:  8  calls  (4+4 LLM, templates free)
+#   agent execution:  48 calls  (12 tasks × 4 steps)
+#   labeling:         24 calls  (12 tasks × 2: primary+secondary)
+#   buffer:           70 calls  (retries, quality checks)
+#   TOTAL:           ~150 calls — fits exactly
 
 def generate_tasks(total: int = 100) -> list[dict]:
     """
@@ -402,31 +520,56 @@ def generate_tasks(total: int = 100) -> list[dict]:
             approved.append(t)
     print(f"  ✅ Template tasks approved: {len([x for x in approved if x.get('generation_strategy') == 'template_based'])}")
 
-    # ── Strategy 2: Rule-based signal conversion (ZERO LLM calls) ──────────────
-    # Signals are converted using keyword matching + templates — no API calls.
-    # This reserves all API quota for the labeling stage where quality matters.
+    # ── Strategy 2: LLM-generative from real signals (rule-based fallback) ──────
     print("\n🌐 Strategy 2: LLM-generative from real-world signals...")
     signals   = collect_all_signals()
     llm_count = 0
     for signal in signals:
         if llm_count >= DAILY_BUDGET["llm_generative"]:
             break
-        task = convert_signal_rule_based(signal)
-        if passes_rule_based_check(task):
+        # Try LLM first — fall back to rule-based if it fails
+        task = convert_signal_to_task(signal)
+        if task is None:
+            task = convert_signal_rule_based(signal)
+        if task and passes_rule_based_check(task):
             save_task(task)
             approved.append(task)
             llm_count += 1
     print(f"  ✅ Signal-based tasks approved: {llm_count}")
 
-    # ── Strategy 3: Mutation-based (rule-based, zero LLM calls) ─────────────────
+    # ── Strategy 3: LLM mutation (rule-based fallback) ───────────────────────────
     print("\n🔀 Strategy 3: Mutation-based generation...")
     seed_tasks     = get_registry_sample(n=DAILY_BUDGET["mutation_based"] + 5)
     mutation_count = 0
+    mutations = [
+        "Add a mid-task failure that requires exponential backoff recovery.",
+        "Add input validation and structured error messages for all edge cases.",
+        "The agent must also send a Slack notification on completion or failure.",
+        "Ensure idempotency — detect and skip duplicates on repeat runs.",
+        "Expand to 2-agent coordination: one fetches/validates, one writes/confirms.",
+    ]
     for seed in seed_tasks:
         if mutation_count >= DAILY_BUDGET["mutation_based"]:
             break
-        task = mutate_task_rule_based(seed)
-        if passes_rule_based_check(task):
+        mutation = random.choice(mutations)
+        prompt = f"""Mutate this agent task to be harder and more realistic:
+
+Original: {seed['task']}
+Mutation to apply: {mutation}
+
+Return ONLY JSON:
+{{
+  "task": "mutated task (1-2 sentences)",
+  "difficulty": "complex",
+  "expected_tools": ["tool1", "tool2"],
+  "likely_failure_points": ["point1"],
+  "generation_strategy": "mutation_based",
+  "freshness_source": "mutation_of_existing"
+}}"""
+        task = call_llm_json("generator", [{"role": "user", "content": prompt}], max_tokens=250)
+        if task is None:
+            task = mutate_task_rule_based(seed)
+        if task and passes_rule_based_check(task):
             save_task(task)
             approved.append(task)
             mutation_count += 1
