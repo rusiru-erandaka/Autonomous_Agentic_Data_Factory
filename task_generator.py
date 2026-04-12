@@ -373,10 +373,10 @@ def passes_rule_based_check(task: dict) -> bool:
 
 # Daily budget breakdown
 DAILY_BUDGET = {
-    "template_based":  2,
-    "llm_generative":  2,
-    "mutation_based":  1,
-}  # 5 tasks/day × 8 calls = 40 req/day — fits free 50 req/day hard limit
+    "template_based":  6,
+    "llm_generative":  5,
+    "mutation_based":  4,
+}  # 15 tasks × 4 steps + 15 labels = ~80 req/day, fits 3-key 150 req/day budget
 
 def generate_tasks(total: int = 100) -> list[dict]:
     """

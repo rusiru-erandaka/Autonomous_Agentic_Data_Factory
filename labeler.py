@@ -259,7 +259,7 @@ Return ONLY this JSON with labels for every step AND the trace overall:
 
 # ── Main Labeling Function ─────────────────────────────────────────────────────
 
-DUAL_LABEL_RATE = 0.10   # label 10% of records with secondary model
+DUAL_LABEL_RATE = 1.00   # dual-label ALL records for reliability
 
 def label_traces(traces: list[dict]) -> list[dict]:
     """
@@ -268,9 +268,7 @@ def label_traces(traces: list[dict]) -> list[dict]:
     """
     labeled  = []
     total    = len(traces)
-    dual_ids = set(
-        random.sample(range(total), max(1, int(total * DUAL_LABEL_RATE)))
-    )
+    dual_ids = set(range(total))  # all traces get dual-labeled
 
     print(f"\n🏷️  Labeling {total} traces with Nemotron (dual-check on {len(dual_ids)})...")
 
