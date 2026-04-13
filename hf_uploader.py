@@ -60,9 +60,11 @@ def flatten_record(record: dict) -> dict:
         "reasoning_coherence":       int(rc),
         "safety_compliance":         int(trace_scores.get("safety_compliance", 0) or 0),
         "overall_quality":           float(trace_scores.get("overall_quality", 0) or 0),
-        "reward_signal":             float(trace_scores.get("reward_signal", 0) or 0),
-        "reward_computed":           reward_computed,
+        # reward_signal IS reward_computed — single formula, no inconsistency
+        # formula: (task_completion*0.4 + tool_use_efficiency*0.3 + reasoning_coherence*0.3) / 3
+        "reward_signal":             reward_computed,
         "reward_formula":            "task_completion*0.4 + tool_use_efficiency*0.3 + reasoning_coherence*0.3 (each /3)",
+        "labeler_model_2":           "qwen/qwen3-next-80b-a3b-instruct:free",  # secondary labeler
         "supervisor_verdict":        trace_scores.get("supervisor_verdict", ""),
         "verdict_reason":            trace_scores.get("verdict_reason", ""),
         "dual_labeled":              bool(record["labels"].get("dual_labeled", False)),
