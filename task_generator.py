@@ -14,7 +14,8 @@ from datetime import datetime
 from typing import Optional
 
 from openrouter_client import call_llm_json
-from task_sources import collect_all_signals
+from task_sources import collect_all_signals, mark_signal_used
+#from tool_registry import TOOL_NAMES, TOOL_LIST_FOR_PROMPT
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "registry", "tasks.db")
 
@@ -175,18 +176,21 @@ Focus on API Orchestration and Code Agent tasks.
 
 {numbered}
 
-Rules:
-- Each task needs at least 2 tool calls
-- Must have at least one realistic failure point
-- Return null for irrelevant signals
+CRITICAL RULES:
+1. expected_tools MUST be chosen ONLY from this exact list:
+{TOOL_NAMES}
+2. Do NOT invent tool names — only use tools from the list above
+3. Each task needs 2-3 realistic tool calls
+4. Must have at least one realistic failure point
+5. Return null for irrelevant signals
 
 Return ONLY a JSON array with exactly {len(signals)} items:
 [
   {{
     "task": "one or two sentence agent task",
     "difficulty": "simple|medium|complex",
-    "expected_tools": ["tool1", "tool2"],
-    "likely_failure_points": ["point1"],
+    "expected_tools": ["web_search", "api_fetch"],
+    "likely_failure_points": ["401 unauthorized", "timeout"],
     "generation_strategy": "llm_generative",
     "freshness_source": "source_here"
   }}
@@ -197,7 +201,28 @@ Return ONLY a JSON array with exactly {len(signals)} items:
         result = [result]
     if not isinstance(result, list):
         return []
-    return [r for r in result if r and isinstance(r, dict) and r.get("task")]
+    return [_validate_task_tools(r) for r in result if r and isinstance(r, dict) and r.get("task")]
+
+
+def _validate_task_tools(task: dict) -> dict:
+    """Ensure expected_tools only contains registered tool names. Fix invalid ones."""
+    tools = task.get("expected_tools", [])
+    valid = [t for t in tools if t in TOOL_NAMES]
+    if not valid:
+        # Assign default tools based on task content
+        text = task.get("task", "").lower()
+        if any(k in text for k in ["stripe", "invoice", "payment"]):
+            valid = ["stripe_list_invoices", "api_fetch", "slack_send_message"]
+        elif any(k in text for k in ["github", "issue", "repo"]):
+            valid = ["github_list_issues", "api_fetch", "file_write"]
+        elif any(k in text for k in ["notion", "database"]):
+            valid = ["notion_query_database", "notion_create_page"]
+        elif any(k in text for k in ["code", "script", "debug", "fix"]):
+            valid = ["code_executor", "web_search", "file_write"]
+        else:
+            valid = ["api_fetch", "api_write", "web_search"]
+    task["expected_tools"] = valid
+    return task
 
 
 def convert_signal_rule_based(signal: dict) -> dict:
@@ -324,15 +349,28 @@ def task_fingerprint(task_text: str) -> str:
     return hashlib.md5(task_text.strip().lower().encode()).hexdigest()
 
 
-def is_duplicate(task_text: str, threshold: float = 0.85) -> bool:
-    """Simple duplicate check — exact hash match for now."""
+def is_duplicate(task_text: str, freshness_source: str = "") -> bool:
+    """
+    Duplicate check on both task text hash AND freshness_source.
+    Prevents same GitHub issue appearing twice with slightly different wording.
+    """
     fp = task_fingerprint(task_text)
     conn = sqlite3.connect(DB_PATH)
-    row = conn.execute(
-        "SELECT 1 FROM tasks WHERE task_id = ?", (fp,)
-    ).fetchone()
+    # Check task hash
+    row = conn.execute("SELECT 1 FROM tasks WHERE task_id = ?", (fp,)).fetchone()
+    if row:
+        conn.close()
+        return True
+    # Check source URL — same source = likely same task
+    if freshness_source and freshness_source not in ("template_library", "mutation_of_existing", ""):
+        row = conn.execute(
+            "SELECT 1 FROM tasks WHERE freshness_source = ?", (freshness_source,)
+        ).fetchone()
+        if row:
+            conn.close()
+            return True
     conn.close()
-    return row is not None
+    return False
 
 
 def save_task(task: dict) -> bool:
@@ -430,7 +468,7 @@ def passes_rule_based_check(task: dict) -> bool:
     text = task["task"].lower()
     if len(text) < 20:
         return False
-    if is_duplicate(task["task"]):
+    if is_duplicate(task["task"], task.get("freshness_source", "")):
         return False
     # Must contain at least one niche keyword
     return any(kw in text for kw in NICHE_KEYWORDS)

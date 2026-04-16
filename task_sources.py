@@ -104,12 +104,12 @@ def fetch_github_issues(max_per_repo: int = 8) -> list[dict]:
                 sig = _sig_id(source, text)
                 if _is_seen(sig):
                     continue
-                _mark_seen(sig)
                 results.append({
                     "raw_text": text,
                     "source":   source,
                     "title":    title,
                     "date":     issue["created_at"][:10],
+                    "_sig_id":  sig,
                 })
             time.sleep(1)
         except Exception as e:
@@ -147,11 +147,11 @@ def fetch_stackoverflow_questions(max_per_tag: int = 5) -> list[dict]:
                 sig = _sig_id(source, text)
                 if _is_seen(sig):
                     continue
-                _mark_seen(sig)
                 results.append({
                     "raw_text": text,
                     "source":   source,
                     "title":    title,
+                    "_sig_id":  sig,
                     "date":     datetime.fromtimestamp(
                         q["creation_date"], tz=timezone.utc).strftime("%Y-%m-%d"),
                 })
@@ -184,11 +184,11 @@ def fetch_hf_daily_papers(max_papers: int = 8) -> list[dict]:
             sig = _sig_id("hf_papers", text)
             if _is_seen(sig):
                 continue
-            _mark_seen(sig)
             results.append({
                 "raw_text": text,
                 "source":   "huggingface_papers",
                 "title":    title,
+                "_sig_id":  sig,
                 "date":     datetime.now().strftime("%Y-%m-%d"),
             })
     except Exception as e:
@@ -221,11 +221,11 @@ def fetch_api_changelogs(max_per_feed: int = 3) -> list[dict]:
                 sig = _sig_id(source, text)
                 if _is_seen(sig):
                     continue
-                _mark_seen(sig)
                 results.append({
                     "raw_text": text,
                     "source":   source,
                     "title":    entry.title,
+                    "_sig_id":  sig,
                     "date":     datetime.now().strftime("%Y-%m-%d"),
                 })
         except Exception as e:
@@ -245,3 +245,14 @@ def collect_all_signals() -> list[dict]:
     signals += fetch_api_changelogs()
     print(f"  ✅ Total NEW signals (deduped): {len(signals)}")
     return signals
+
+
+def mark_signal_used(signal: dict):
+    """
+    Call this AFTER a signal has been successfully converted to an approved task.
+    Signals are only marked seen when actually used — never during collection.
+    This prevents signals from being permanently burned by failed/interrupted runs.
+    """
+    sig_id = signal.get("_sig_id")
+    if sig_id:
+        _mark_seen(sig_id)
