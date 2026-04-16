@@ -19,6 +19,10 @@ from bs4 import BeautifulSoup
 
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 
+# Default behavior for local/dev runs: fetch usable signals every run.
+# Set REUSE_SEEN_SIGNALS=false if you want strict "new only" collection.
+REUSE_SEEN_SIGNALS = os.environ.get("REUSE_SEEN_SIGNALS", "true").lower() == "true"
+
 # ── Seen-signal registry (SQLite) ─────────────────────────────────────────────
 _SEEN_DB = os.path.join(os.path.dirname(__file__), "registry", "seen_signals.db")
 
@@ -75,7 +79,7 @@ GITHUB_REPOS = [
     ("run-llama/llama_index",    "agent"),
 ]
 
-def fetch_github_issues(max_per_repo: int = 8) -> list[dict]:
+def fetch_github_issues(max_per_repo: int = 8, reuse_seen: bool = REUSE_SEEN_SIGNALS) -> list[dict]:
     _init_seen_db()
     results = []
     headers = {"Authorization": f"Bearer {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
@@ -102,7 +106,7 @@ def fetch_github_issues(max_per_repo: int = 8) -> list[dict]:
                 if not _is_relevant(text):
                     continue
                 sig = _sig_id(source, text)
-                if _is_seen(sig):
+                if not reuse_seen and _is_seen(sig):
                     continue
                 results.append({
                     "raw_text": text,
@@ -115,7 +119,8 @@ def fetch_github_issues(max_per_repo: int = 8) -> list[dict]:
         except Exception as e:
             print(f"  ⚠️  GitHub {repo}: {e}")
 
-    print(f"  📦 GitHub: {len(results)} new signals")
+    label = "signals" if reuse_seen else "new signals"
+    print(f"  📦 GitHub: {len(results)} {label}")
     return results
 
 
@@ -123,7 +128,7 @@ def fetch_github_issues(max_per_repo: int = 8) -> list[dict]:
 SO_TAGS = ["langchain", "openai-api", "stripe-api", "notion-api",
            "github-api", "llm-agent", "autogen", "crewai"]
 
-def fetch_stackoverflow_questions(max_per_tag: int = 5) -> list[dict]:
+def fetch_stackoverflow_questions(max_per_tag: int = 5, reuse_seen: bool = REUSE_SEEN_SIGNALS) -> list[dict]:
     _init_seen_db()
     results = []
     for tag in SO_TAGS:
@@ -145,7 +150,7 @@ def fetch_stackoverflow_questions(max_per_tag: int = 5) -> list[dict]:
                 if not _is_relevant(text):
                     continue
                 sig = _sig_id(source, text)
-                if _is_seen(sig):
+                if not reuse_seen and _is_seen(sig):
                     continue
                 results.append({
                     "raw_text": text,
@@ -159,12 +164,13 @@ def fetch_stackoverflow_questions(max_per_tag: int = 5) -> list[dict]:
         except Exception as e:
             print(f"  ⚠️  SO tag '{tag}': {e}")
 
-    print(f"  📦 Stack Overflow: {len(results)} new signals")
+    label = "signals" if reuse_seen else "new signals"
+    print(f"  📦 Stack Overflow: {len(results)} {label}")
     return results
 
 
 # ── HuggingFace Daily Papers ──────────────────────────────────────────────────
-def fetch_hf_daily_papers(max_papers: int = 8) -> list[dict]:
+def fetch_hf_daily_papers(max_papers: int = 8, reuse_seen: bool = REUSE_SEEN_SIGNALS) -> list[dict]:
     _init_seen_db()
     results = []
     try:
@@ -182,7 +188,7 @@ def fetch_hf_daily_papers(max_papers: int = 8) -> list[dict]:
             if not _is_relevant(text):
                 continue
             sig = _sig_id("hf_papers", text)
-            if _is_seen(sig):
+            if not reuse_seen and _is_seen(sig):
                 continue
             results.append({
                 "raw_text": text,
@@ -194,7 +200,8 @@ def fetch_hf_daily_papers(max_papers: int = 8) -> list[dict]:
     except Exception as e:
         print(f"  ⚠️  HF papers: {e}")
 
-    print(f"  📦 HuggingFace Papers: {len(results)} new signals")
+    label = "signals" if reuse_seen else "new signals"
+    print(f"  📦 HuggingFace Papers: {len(results)} {label}")
     return results
 
 
@@ -205,7 +212,7 @@ CHANGELOG_FEEDS = {
     "openai": "https://openai.com/blog/rss.xml",
 }
 
-def fetch_api_changelogs(max_per_feed: int = 3) -> list[dict]:
+def fetch_api_changelogs(max_per_feed: int = 3, reuse_seen: bool = REUSE_SEEN_SIGNALS) -> list[dict]:
     _init_seen_db()
     results = []
     for api_name, feed_url in CHANGELOG_FEEDS.items():
@@ -219,7 +226,7 @@ def fetch_api_changelogs(max_per_feed: int = 3) -> list[dict]:
                 if not _is_relevant(text):
                     continue
                 sig = _sig_id(source, text)
-                if _is_seen(sig):
+                if not reuse_seen and _is_seen(sig):
                     continue
                 results.append({
                     "raw_text": text,
@@ -231,19 +238,21 @@ def fetch_api_changelogs(max_per_feed: int = 3) -> list[dict]:
         except Exception as e:
             print(f"  ⚠️  Changelog '{api_name}': {e}")
 
-    print(f"  📦 API Changelogs: {len(results)} new signals")
+    label = "signals" if reuse_seen else "new signals"
+    print(f"  📦 API Changelogs: {len(results)} {label}")
     return results
 
 
 # ── Aggregator ────────────────────────────────────────────────────────────────
-def collect_all_signals() -> list[dict]:
+def collect_all_signals(reuse_seen: bool = REUSE_SEEN_SIGNALS) -> list[dict]:
     print("🌐 Collecting real-world signals...")
     signals = []
-    signals += fetch_github_issues()
-    signals += fetch_stackoverflow_questions()
-    signals += fetch_hf_daily_papers()
-    signals += fetch_api_changelogs()
-    print(f"  ✅ Total NEW signals (deduped): {len(signals)}")
+    signals += fetch_github_issues(reuse_seen=reuse_seen)
+    signals += fetch_stackoverflow_questions(reuse_seen=reuse_seen)
+    signals += fetch_hf_daily_papers(reuse_seen=reuse_seen)
+    signals += fetch_api_changelogs(reuse_seen=reuse_seen)
+    label = "signals" if reuse_seen else "NEW signals (deduped)"
+    print(f"  ✅ Total {label}: {len(signals)}")
     return signals
 
 

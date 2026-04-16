@@ -19,6 +19,10 @@ from task_sources import collect_all_signals, mark_signal_used
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "registry", "tasks.db")
 
+# When true, reruns may create new tasks from the same GitHub issue/changelog
+# source. Exact duplicate task text is still blocked by task_fingerprint().
+ALLOW_REUSED_SIGNAL_SOURCES = os.environ.get("ALLOW_REUSED_SIGNAL_SOURCES", "true").lower() == "true"
+
 # ── YAML-style templates stored as Python dicts (no extra file needed) ─────────
 TASK_TEMPLATES = [
     {
@@ -361,8 +365,13 @@ def is_duplicate(task_text: str, freshness_source: str = "") -> bool:
     if row:
         conn.close()
         return True
-    # Check source URL — same source = likely same task
-    if freshness_source and freshness_source not in ("template_library", "mutation_of_existing", ""):
+    # Check source URL — same source = likely same task. Disabled by default for
+    # interactive reruns so current real-world signals can be reused.
+    if (
+        not ALLOW_REUSED_SIGNAL_SOURCES
+        and freshness_source
+        and freshness_source not in ("template_library", "mutation_of_existing", "")
+    ):
         row = conn.execute(
             "SELECT 1 FROM tasks WHERE freshness_source = ?", (freshness_source,)
         ).fetchone()
