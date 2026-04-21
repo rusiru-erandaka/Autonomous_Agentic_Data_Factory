@@ -19,10 +19,6 @@ from task_sources import collect_all_signals, mark_signal_used
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "registry", "tasks.db")
 
-# When true, reruns may create new tasks from the same GitHub issue/changelog
-# source. Exact duplicate task text is still blocked by task_fingerprint().
-ALLOW_REUSED_SIGNAL_SOURCES = os.environ.get("ALLOW_REUSED_SIGNAL_SOURCES", "true").lower() == "true"
-
 # ── YAML-style templates stored as Python dicts (no extra file needed) ─────────
 TASK_TEMPLATES = [
     {
@@ -160,7 +156,7 @@ Return ONLY JSON (or null):
   "generation_strategy": "llm_generative",
   "freshness_source": "{signal['source']}"
 }}"""
-    return call_llm_json("generator", [{"role": "user", "content": prompt}], max_tokens=300)
+    return call_llm_json("generator", [{"role": "user", "content": prompt}], max_tokens=600)
 
 
 def convert_signals_llm(signals: list[dict]) -> list[dict]:
@@ -355,31 +351,14 @@ def task_fingerprint(task_text: str) -> str:
 
 def is_duplicate(task_text: str, freshness_source: str = "") -> bool:
     """
-    Duplicate check on both task text hash AND freshness_source.
-    Prevents same GitHub issue appearing twice with slightly different wording.
+    Duplicate check based on task text hash only.
+    Source-based dedup removed — it blocked all signals from same repo.
     """
     fp = task_fingerprint(task_text)
     conn = sqlite3.connect(DB_PATH)
-    # Check task hash
     row = conn.execute("SELECT 1 FROM tasks WHERE task_id = ?", (fp,)).fetchone()
-    if row:
-        conn.close()
-        return True
-    # Check source URL — same source = likely same task. Disabled by default for
-    # interactive reruns so current real-world signals can be reused.
-    if (
-        not ALLOW_REUSED_SIGNAL_SOURCES
-        and freshness_source
-        and freshness_source not in ("template_library", "mutation_of_existing", "")
-    ):
-        row = conn.execute(
-            "SELECT 1 FROM tasks WHERE freshness_source = ?", (freshness_source,)
-        ).fetchone()
-        if row:
-            conn.close()
-            return True
     conn.close()
-    return False
+    return row is not None
 
 
 def save_task(task: dict) -> bool:
@@ -532,9 +511,9 @@ Return ONLY a JSON array with exactly {len(seed_tasks)} items:
 
 # Daily budget breakdown
 DAILY_BUDGET = {
-    "template_based":  4,    # 0 LLM calls (pure template)
-    "llm_generative":  4,    # 4 LLM calls (generator model)
-    "mutation_based":  4,    # 4 LLM calls (generator model)
+    "template_based":  2,    # lowest priority — synthetic fallback
+    "llm_generative":  8,    # HIGHEST PRIORITY — real signals from web
+    "mutation_based":  2,    # lowest priority — synthetic fallback
 }
 # Total call budget breakdown (3 keys = 150 req/day):
 #   task generation:  8  calls  (4+4 LLM, templates free)
@@ -546,81 +525,76 @@ DAILY_BUDGET = {
 def generate_tasks(total: int = 100) -> list[dict]:
     """
     Full task generation run.
-    Returns list of validated tasks ready for agent execution.
-
-    Rate-limit strategy:
-      template_based  → rule-based check only, zero LLM calls
-      llm_generative  → rule-based keyword matching, ZERO LLM calls
-      mutation_based  → batched LLM calls, 5s delay between batches
+    Priority order: Signal-based (real web data) → Template → Mutation
+    Signal-based tasks are highest priority because they're grounded in real problems.
     """
     init_registry()
     approved = []
 
-    # ── Strategy 1: Template-based (zero LLM calls) ───────────────────────────
-    print("\n📋 Strategy 1: Template-based generation...")
-    template_tasks = generate_template_tasks(count=DAILY_BUDGET["template_based"] + 10)
-    for t in template_tasks:
-        if len([x for x in approved if x.get("generation_strategy") == "template_based"]) >= DAILY_BUDGET["template_based"]:
-            break
-        if passes_rule_based_check(t):
-            save_task(t)
-            approved.append(t)
-    print(f"  ✅ Template tasks approved: {len([x for x in approved if x.get('generation_strategy') == 'template_based'])}")
-
-    # ── Strategy 2: LLM-generative from real signals (rule-based fallback) ──────
-    print("\n🌐 Strategy 2: LLM-generative from real-world signals...")
+    # ── Strategy 1 (HIGHEST PRIORITY): LLM-generative from real signals ────────
+    # Run this FIRST — real signals produce the most valuable tasks.
+    print("\n🌐 Strategy 1 (Priority): LLM-generative from real-world signals...")
     signals   = collect_all_signals()
     llm_count = 0
     for signal in signals:
         if llm_count >= DAILY_BUDGET["llm_generative"]:
             break
-        # Try LLM first — fall back to rule-based if it fails
         task = convert_signal_to_task(signal)
         if task is None:
             task = convert_signal_rule_based(signal)
         if task and passes_rule_based_check(task):
             save_task(task)
             approved.append(task)
+            mark_signal_used(signal)
             llm_count += 1
     print(f"  ✅ Signal-based tasks approved: {llm_count}")
 
-    # ── Strategy 3: LLM mutation (rule-based fallback) ───────────────────────────
-    print("\n🔀 Strategy 3: Mutation-based generation...")
-    seed_tasks     = get_registry_sample(n=DAILY_BUDGET["mutation_based"] + 5)
-    mutation_count = 0
-    mutations = [
-        "Add a mid-task failure that requires exponential backoff recovery.",
-        "Add input validation and structured error messages for all edge cases.",
-        "The agent must also send a Slack notification on completion or failure.",
-        "Ensure idempotency — detect and skip duplicates on repeat runs.",
-        "Expand to 2-agent coordination: one fetches/validates, one writes/confirms.",
-    ]
-    for seed in seed_tasks:
-        if mutation_count >= DAILY_BUDGET["mutation_based"]:
+    # ── Strategy 2: Template-based (fallback if signals run dry) ─────────────
+    print("\n📋 Strategy 2 (Fallback): Template-based generation...")
+    template_tasks = generate_template_tasks(count=DAILY_BUDGET["template_based"] + 5)
+    tmpl_count = 0
+    for t in template_tasks:
+        if tmpl_count >= DAILY_BUDGET["template_based"]:
             break
-        mutation = random.choice(mutations)
-        prompt = f"""Mutate this agent task to be harder and more realistic:
+        if passes_rule_based_check(t):
+            save_task(t)
+            approved.append(t)
+            tmpl_count += 1
+    print(f"  ✅ Template tasks approved: {tmpl_count}")
 
-Original: {seed['task']}
-Mutation to apply: {mutation}
-
-Return ONLY JSON:
-{{
-  "task": "mutated task (1-2 sentences)",
-  "difficulty": "complex",
-  "expected_tools": ["tool1", "tool2"],
-  "likely_failure_points": ["point1"],
-  "generation_strategy": "mutation_based",
-  "freshness_source": "mutation_of_existing"
-}}"""
-        task = call_llm_json("generator", [{"role": "user", "content": prompt}], max_tokens=250)
-        if task is None:
-            task = mutate_task_rule_based(seed)
-        if task and passes_rule_based_check(task):
-            save_task(task)
-            approved.append(task)
-            mutation_count += 1
-    print(f"  ✅ Mutation-based tasks approved: {mutation_count}")
+    # ── Strategy 3: Mutation-based (only if still need more tasks) ───────────
+    remaining = total - len(approved)
+    if remaining > 0:
+        print("\n🔀 Strategy 3 (Fallback): Mutation-based generation...")
+        seed_tasks     = get_registry_sample(n=DAILY_BUDGET["mutation_based"] + 5)
+        mutation_count = 0
+        mutations = [
+            " Handle the case where the initial API call fails with 429 — implement exponential backoff.",
+            " Validate all inputs before processing and return structured error messages for invalid data.",
+            " Log every step to a file and send a Slack notification on completion or failure.",
+            " Ensure idempotency — running twice must not create duplicate records.",
+            " Coordinate two agents: one fetches and validates, one writes and confirms output.",
+        ]
+        for seed in seed_tasks:
+            if mutation_count >= min(DAILY_BUDGET["mutation_based"], remaining):
+                break
+            suffix, extra_fail = mutations[mutation_count % len(mutations)], "edge case unhandled"
+            base_task = seed.get("task", "")
+            if not base_task:
+                continue
+            mutated = {
+                "task":                  base_task + suffix,
+                "difficulty":            "complex",
+                "expected_tools":        seed.get("expected_tools", ["api_fetch", "api_write"]),
+                "likely_failure_points": (seed.get("likely_failure_points", []) + [extra_fail])[:3],
+                "generation_strategy":   "mutation_based",
+                "freshness_source":      "mutation_of_existing",
+            }
+            if passes_rule_based_check(mutated):
+                save_task(mutated)
+                approved.append(mutated)
+                mutation_count += 1
+        print(f"  ✅ Mutation-based tasks approved: {mutation_count}")
 
     print(f"\n✅ Total tasks approved for today: {len(approved)}")
     return approved[:total]
