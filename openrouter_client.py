@@ -5,9 +5,8 @@ IMPORTANT ABOUT KEY ROTATION:
 - Per-MINUTE limit (20 req/min): Shared across ALL keys on the same account.
   Switching keys does NOT help — you must wait ~60s.
 - Per-DAY limit (50 req/day free): Per-key. Switching keys DOES help here.
-- Strategy: on 429, classify the response. Treat ambiguous 429s as shared
-  per-minute throttles and wait; only rotate/mark keys when the response text
-  clearly indicates a daily/quota exhaustion.
+- Strategy: on 429, first wait 65s (per-minute reset), then retry.
+  If still 429, mark key as daily-exhausted and switch to next key.
 """
 
 import os
@@ -19,17 +18,20 @@ from typing import Optional
 BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 MODELS = {
+    # Agent: strongest available free model for best task solving
     "agent":        "nvidia/nemotron-3-super-120b-a12b:free",
     "agent_backup": "openai/gpt-oss-120b:free",
+    # Labelers: different models for genuine dual-label diversity
     "labeler":      "arcee-ai/trinity-large-preview:free",
     "secondary":    "qwen/qwen3-next-80b-a3b-instruct:free",
-    "generator":    "minimax/minimax-m2.5:free",
-    "quality_gate": "z-ai/glm-4.5-air:free",
+    # Generator: strong model for quality signal→task conversion
+    "generator":    "nvidia/nemotron-3-super-120b-a12b:free",
+    "quality_gate": "minimax/minimax-m2.5:free",
 }
 
 # ── Rate limit constants ───────────────────────────────────────────────────────
 MIN_SECONDS_BETWEEN_CALLS = 6.0   # 10 req/min max
-PER_MINUTE_WAIT           = 75    # wait after shared account-level 429
+PER_MINUTE_WAIT           = 65    # wait after per-minute 429
 PER_DAY_EXHAUSTED_WAIT    = 3700  # ~1hr after daily limit hit
 MAX_RETRIES               = 8
 RETRY_BACKOFF             = [5, 10, 20]
@@ -39,6 +41,7 @@ _last_call_time: float = 0.0
 # Daily-exhausted keys: {key_prefix: exhausted_until_timestamp}
 # Per-minute 429s are handled by sleeping, NOT by marking exhausted
 _daily_exhausted_until: dict = {}
+_consecutive_429: dict = {}  # module-level — persists across calls
 
 
 def _load_keys() -> list[str]:
@@ -70,56 +73,6 @@ def _mark_daily_exhausted(key: str):
     print(f"  🔒 Key {_key_id(key)} daily limit reached — marked exhausted for ~1hr")
 
 
-def _classify_429(response: requests.Response) -> str:
-    """
-    OpenRouter can return 429 for both per-minute throttles and daily/quota
-    exhaustion. The per-minute free-model limit is account-level, so switching
-    keys immediately just burns attempts. Only classify as daily when the body
-    explicitly says so.
-    """
-    try:
-        body = response.text.lower()
-    except Exception:
-        body = ""
-
-    daily_markers = [
-        "daily",
-        "per day",
-        "requests per day",
-        "quota",
-        "quota exceeded",
-        "usage limit",
-        "free model usage limit",
-        "limit for this model has been reached",
-        "insufficient credits",
-    ]
-    if any(marker in body for marker in daily_markers):
-        return "daily"
-    return "per_minute"
-
-
-def _retry_after_seconds(response: requests.Response) -> int:
-    """Prefer provider retry headers, otherwise use the conservative default."""
-    retry_after = response.headers.get("Retry-After")
-    if retry_after:
-        try:
-            return max(1, int(float(retry_after)))
-        except ValueError:
-            pass
-
-    reset = response.headers.get("X-RateLimit-Reset")
-    if reset:
-        try:
-            reset_value = float(reset)
-            # Some providers send epoch seconds, others send seconds-until-reset.
-            wait = reset_value - time.time() if reset_value > 1_000_000_000 else reset_value
-            return max(1, int(wait) + 2)
-        except ValueError:
-            pass
-
-    return PER_MINUTE_WAIT
-
-
 def _get_available_key(keys: list[str]) -> Optional[str]:
     """Return first key not daily-exhausted."""
     for key in keys:
@@ -149,9 +102,9 @@ def call_llm(
     Call an OpenRouter free model.
 
     429 handling strategy:
-    - Per-minute/account throttle → wait for reset and retry the same request.
-    - Daily/quota exhaustion → mark that key unavailable and try another key.
-    - Ambiguous 429 → assume per-minute throttle to avoid false daily exhaustion.
+    - First 429 → wait 65s (per-minute window reset), retry SAME key
+    - Second 429 on same key → mark key daily-exhausted, switch to next key
+    - All keys daily-exhausted → wait for soonest reset
     """
     model = MODELS.get(role)
     if not model:
@@ -203,24 +156,24 @@ def call_llm(
             )
 
             if response.status_code == 429:
-                kind = _classify_429(response)
-                remaining = response.headers.get("X-RateLimit-Remaining", "?")
+                kid = _key_id(key)
+                _consecutive_429[kid] = _consecutive_429.get(kid, 0) + 1
 
-                if kind == "daily":
+                if _consecutive_429[kid] >= 2:
+                    # Two consecutive 429s on same key = daily limit hit
                     _mark_daily_exhausted(key)
-                    next_key = _get_available_key(keys)
-                    if next_key:
-                        next_num = keys.index(next_key) + 1
-                        print(f"  🔁 Switching to OPENROUTER_API_KEY_{next_num} without stopping pipeline...")
-                    continue
+                    _consecutive_429[kid] = 0
+                    print(f"  🔄 Switching to next key after daily limit on {kid}")
+                    continue  # switch key immediately, no sleep
+                else:
+                    # First 429 = per-minute limit — wait for window reset
+                    remaining = response.headers.get("X-RateLimit-Remaining", "?")
+                    print(f"  ⚠️  Per-minute limit (remaining={remaining}) — waiting {PER_MINUTE_WAIT}s...")
+                    time.sleep(PER_MINUTE_WAIT)
+                    continue  # retry SAME key after waiting
 
-                wait = _retry_after_seconds(response)
-                print(
-                    f"  ⚠️  Shared per-minute OpenRouter limit "
-                    f"(remaining={remaining}) — waiting {wait}s before retry..."
-                )
-                time.sleep(wait)
-                continue
+            # Successful response — reset consecutive 429 counter
+            _consecutive_429[_key_id(key)] = 0
 
             if response.status_code == 503:
                 wait = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]

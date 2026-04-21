@@ -10,24 +10,31 @@ import sys
 
 # ── Load .env file FIRST before any other imports read env vars ───────────────
 def _load_env():
-    env_path = os.path.join(os.path.dirname(__file__), ".env")
+    """Load .env file — works on Windows and Linux, with or without export prefix."""
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
     if not os.path.exists(env_path):
-        print("⚠️  No .env file found. Create one from .env.example")
+        print("\u26a0\ufe0f  No .env file found — create one from .env.example")
         return
-    with open(env_path) as f:
+    loaded = 0
+    with open(env_path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            # Handle both: export KEY="val" and KEY="val"
-            line = line.removeprefix("export").strip()
+            if line.lower().startswith("export "):
+                line = line[7:].strip()
             if "=" not in line:
                 continue
             key, _, val = line.partition("=")
-            val = val.strip().strip('"\'\'')
-            os.environ.setdefault(key.strip(), val)
-    print("✅ .env loaded")
-
+            key = key.strip()
+            val = val.strip()
+            if len(val) >= 2 and val[0] in ('"', "'") and val[-1] == val[0]:
+                val = val[1:-1]
+            if not key or val in ("", "...", "replace_with_your_key"):
+                continue
+            os.environ[key] = val
+            loaded += 1
+    print(f"\u2705 .env loaded ({loaded} keys set)")
 _load_env()
 
 import time
