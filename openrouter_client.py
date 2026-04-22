@@ -1,12 +1,28 @@
 """
 openrouter_client.py
 
-IMPORTANT ABOUT KEY ROTATION:
-- Per-MINUTE limit (20 req/min): Shared across ALL keys on the same account.
-  Switching keys does NOT help — you must wait ~60s.
-- Per-DAY limit (50 req/day free): Per-key. Switching keys DOES help here.
-- Strategy: on 429, first wait 65s (per-minute reset), then retry.
-  If still 429, mark key as daily-exhausted and switch to next key.
+Stage-based API key assignment — each pipeline stage uses a dedicated key:
+
+  Stage 1 — Task Generation  → OPENROUTER_API_KEY_1
+    roles: generator
+    ~8 calls/day (signal conversion + mutations)
+
+  Stage 2 — Agent Execution  → OPENROUTER_API_KEY_2  (heaviest stage)
+    roles: agent, agent_backup
+    ~48 calls/day (12 tasks × 4 steps)
+
+  Stage 3 — Labeling         → OPENROUTER_API_KEY_3
+    roles: labeler, secondary
+    ~24 calls/day (12 tasks × 2 labelers)
+
+  Stages 4 & 5 (Quality Gate, HF Upload) make zero LLM calls.
+
+Why this works better than round-robin:
+  - Each key stays well under 50 req/day
+  - No cross-stage interference
+  - Per-minute limit (20 req/min) per key is respected by MIN_SECONDS_BETWEEN_CALLS
+  - On 429: wait for per-minute reset on same key (don't switch — switching
+    doesn't help for per-minute limits since all keys share account-level quota)
 """
 
 import os
@@ -17,71 +33,73 @@ from typing import Optional
 
 BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
 
+# ── Stage → Role → Model mapping ──────────────────────────────────────────────
 MODELS = {
-    # Agent: strongest available free model for best task solving
+    # Stage 1: Task generation
+    "generator":    "nvidia/nemotron-3-super-120b-a12b:free",
+
+    # Stage 2: Agent execution (strongest free model for best task solving)
     "agent":        "nvidia/nemotron-3-super-120b-a12b:free",
     "agent_backup": "openai/gpt-oss-120b:free",
-    # Labelers: different models for genuine dual-label diversity
+
+    # Stage 3: Labeling (two different models for genuine dual-label)
     "labeler":      "arcee-ai/trinity-large-preview:free",
     "secondary":    "qwen/qwen3-next-80b-a3b-instruct:free",
-    # Generator: strong model for quality signal→task conversion
-    "generator":    "nvidia/nemotron-3-super-120b-a12b:free",
+
+    # Utility (uses KEY_1 by default)
     "quality_gate": "minimax/minimax-m2.5:free",
 }
 
-# ── Rate limit constants ───────────────────────────────────────────────────────
-MIN_SECONDS_BETWEEN_CALLS = 6.0   # 10 req/min max
-PER_MINUTE_WAIT           = 65    # wait after per-minute 429
-PER_DAY_EXHAUSTED_WAIT    = 3700  # ~1hr after daily limit hit
-MAX_RETRIES               = 8
+# ── Role → which API key to use ───────────────────────────────────────────────
+# Roles are assigned to keys based on which pipeline stage they belong to.
+ROLE_TO_KEY_SLOT = {
+    "generator":    1,   # Stage 1 → KEY_1
+    "quality_gate": 1,   # Stage 1 utility → KEY_1
+    "agent":        2,   # Stage 2 → KEY_2
+    "agent_backup": 2,   # Stage 2 fallback → KEY_2
+    "labeler":      3,   # Stage 3 → KEY_3
+    "secondary":    3,   # Stage 3 secondary → KEY_3
+}
+
+# ── Rate limit config ──────────────────────────────────────────────────────────
+MIN_SECONDS_BETWEEN_CALLS = 6.0   # 10 req/min — under the 20 req/min limit
+PER_MINUTE_WAIT           = 70    # wait after per-minute 429
+MAX_RETRIES               = 5
 RETRY_BACKOFF             = [5, 10, 20]
 
 _last_call_time: float = 0.0
 
-# Daily-exhausted keys: {key_prefix: exhausted_until_timestamp}
-# Per-minute 429s are handled by sleeping, NOT by marking exhausted
-_daily_exhausted_until: dict = {}
-_consecutive_429: dict = {}  # module-level — persists across calls
 
-
-def _load_keys() -> list[str]:
-    """Load API keys from environment at call time."""
-    keys = []
-    for i in range(1, 4):
-        k = os.environ.get(f"OPENROUTER_API_KEY_{i}", "").strip()
-        if k and not k.startswith("sk-or-v1-replace"):
-            keys.append(k)
-    if not keys:
+def _load_key(slot: int) -> str:
+    """
+    Load a specific API key by slot number (1, 2, or 3) from environment.
+    Called at request time — never at import time.
+    """
+    key = os.environ.get(f"OPENROUTER_API_KEY_{slot}", "").strip()
+    if not key or key.startswith("sk-or-v1-replace"):
+        # Fallback: if the specific slot isn't set, try others in order
+        for fallback in [1, 2, 3]:
+            k = os.environ.get(f"OPENROUTER_API_KEY_{fallback}", "").strip()
+            if k and not k.startswith("sk-or-v1-replace"):
+                print(f"  ⚠️  KEY_{slot} not set — falling back to KEY_{fallback}")
+                return k
         raise EnvironmentError(
-            "\n❌ No OpenRouter API keys found.\n"
-            "   Set OPENROUTER_API_KEY_1, _2, _3 in your .env file."
+            f"\n❌ OPENROUTER_API_KEY_{slot} not found in environment.\n"
+            f"   Make sure your .env file has:\n"
+            f"   OPENROUTER_API_KEY_1=sk-or-v1-...\n"
+            f"   OPENROUTER_API_KEY_2=sk-or-v1-...\n"
+            f"   OPENROUTER_API_KEY_3=sk-or-v1-...\n"
         )
-    return keys
+    return key
 
 
-def _key_id(key: str) -> str:
-    """Short ID for logging — never logs the full key."""
+def _key_display(key: str) -> str:
+    """Short display string — never logs the full key."""
     return key[:16] + "..."
 
 
-def _is_daily_exhausted(key: str) -> bool:
-    return time.time() < _daily_exhausted_until.get(_key_id(key), 0)
-
-
-def _mark_daily_exhausted(key: str):
-    _daily_exhausted_until[_key_id(key)] = time.time() + PER_DAY_EXHAUSTED_WAIT
-    print(f"  🔒 Key {_key_id(key)} daily limit reached — marked exhausted for ~1hr")
-
-
-def _get_available_key(keys: list[str]) -> Optional[str]:
-    """Return first key not daily-exhausted."""
-    for key in keys:
-        if not _is_daily_exhausted(key):
-            return key
-    return None
-
-
 def _enforce_rate_limit():
+    """Enforce minimum gap between ALL calls to stay under 20 req/min."""
     global _last_call_time
     elapsed = time.time() - _last_call_time
     gap = MIN_SECONDS_BETWEEN_CALLS - elapsed
@@ -99,16 +117,23 @@ def call_llm(
     retries: int = MAX_RETRIES,
 ) -> Optional[str]:
     """
-    Call an OpenRouter free model.
+    Call an OpenRouter free model using stage-based key assignment.
 
-    429 handling strategy:
-    - First 429 → wait 65s (per-minute window reset), retry SAME key
-    - Second 429 on same key → mark key daily-exhausted, switch to next key
-    - All keys daily-exhausted → wait for soonest reset
+    Each role maps to a fixed API key slot:
+      generator/quality_gate → KEY_1  (Stage 1)
+      agent/agent_backup     → KEY_2  (Stage 2)
+      labeler/secondary      → KEY_3  (Stage 3)
+
+    On 429 (per-minute limit): wait PER_MINUTE_WAIT seconds then retry
+    same key. Switching keys does NOT help for per-minute limits since
+    all keys on the same account share the 20 req/min bucket.
     """
     model = MODELS.get(role)
     if not model:
         raise ValueError(f"Unknown role '{role}'. Valid: {list(MODELS.keys())}")
+
+    key_slot = ROLE_TO_KEY_SLOT.get(role, 1)
+    key      = _load_key(key_slot)
 
     if json_mode:
         messages = messages.copy()
@@ -124,31 +149,15 @@ def call_llm(
         "max_tokens":  max_tokens,
     }
 
-    keys = _load_keys()
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type":  "application/json",
+        "HTTP-Referer":  "https://github.com/your-username/agent-behavior-dataset",
+        "X-Title":       "Agent Behavior Dataset Pipeline",
+    }
 
     for attempt in range(retries):
         _enforce_rate_limit()
-
-        key = _get_available_key(keys)
-        if key is None:
-            # All keys daily-exhausted
-            now      = time.time()
-            min_wait = min(
-                max(0, _daily_exhausted_until.get(_key_id(k), 0) - now)
-                for k in keys
-            )
-            print(f"  ⏳ All {len(keys)} keys daily-exhausted. Waiting {int(min_wait//60)}m {int(min_wait%60)}s...")
-            time.sleep(min_wait + 5)
-            key = _get_available_key(keys)
-            if key is None:
-                return None
-
-        headers = {
-            "Authorization": f"Bearer {key}",
-            "Content-Type":  "application/json",
-            "HTTP-Referer":  "https://github.com/your-username/agent-behavior-dataset",
-            "X-Title":       "Agent Behavior Dataset Pipeline",
-        }
 
         try:
             response = requests.post(
@@ -156,28 +165,23 @@ def call_llm(
             )
 
             if response.status_code == 429:
-                kid = _key_id(key)
-                _consecutive_429[kid] = _consecutive_429.get(kid, 0) + 1
+                remaining   = response.headers.get("X-RateLimit-Remaining", "?")
+                retry_after = response.headers.get("Retry-After", "")
 
-                if _consecutive_429[kid] >= 2:
-                    # Two consecutive 429s on same key = daily limit hit
-                    _mark_daily_exhausted(key)
-                    _consecutive_429[kid] = 0
-                    print(f"  🔄 Switching to next key after daily limit on {kid}")
-                    continue  # switch key immediately, no sleep
+                # Determine wait time — use server's Retry-After if available
+                if retry_after and retry_after.isdigit():
+                    wait = int(retry_after) + 5
                 else:
-                    # First 429 = per-minute limit — wait for window reset
-                    remaining = response.headers.get("X-RateLimit-Remaining", "?")
-                    print(f"  ⚠️  Per-minute limit (remaining={remaining}) — waiting {PER_MINUTE_WAIT}s...")
-                    time.sleep(PER_MINUTE_WAIT)
-                    continue  # retry SAME key after waiting
+                    wait = PER_MINUTE_WAIT
 
-            # Successful response — reset consecutive 429 counter
-            _consecutive_429[_key_id(key)] = 0
+                print(f"  ⚠️  429 on KEY_{key_slot} [{role}] "
+                      f"(remaining={remaining}) — waiting {wait}s...")
+                time.sleep(wait)
+                continue   # retry same key after waiting
 
             if response.status_code == 503:
                 wait = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
-                print(f"  ⚠️  503 unavailable — retrying in {wait}s...")
+                print(f"  ⚠️  503 model unavailable — retrying in {wait}s...")
                 time.sleep(wait)
                 continue
 
@@ -186,7 +190,8 @@ def call_llm(
             choices = data.get("choices") or []
 
             if not choices:
-                print(f"  ⚠️  Empty choices on '{role}'. Raw: {str(data)[:200]}")
+                raw_preview = str(data)[:200]
+                print(f"  ⚠️  Empty choices on '{role}'. Raw: {raw_preview}")
                 time.sleep(RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)])
                 continue
 
@@ -195,12 +200,12 @@ def call_llm(
 
             if content is None:
                 finish_reason = choices[0].get("finish_reason", "unknown")
-                print(f"  ⚠️  Null content on '{role}' (finish_reason={finish_reason}) — retrying...")
+                print(f"  ⚠️  Null content on '{role}' "
+                      f"(finish_reason={finish_reason}) — retrying...")
                 time.sleep(RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)])
                 continue
 
-            key_num = (keys.index(key) + 1) if key in keys else "?"
-            print(f"  ✓  [{role}] key#{key_num} → {model.split('/')[1][:25]}")
+            print(f"  ✓  [{role}] KEY_{key_slot} → {model.split('/')[1][:25]}")
             return content.strip()
 
         except requests.exceptions.Timeout:
@@ -213,11 +218,12 @@ def call_llm(
             print(f"  ❌ Attempt {attempt+1}: {e} — retrying in {wait}s...")
             time.sleep(wait)
 
-    print(f"  ❌ All {retries} attempts failed for role '{role}'.")
+    print(f"  ❌ All {retries} attempts failed for role '{role}' on KEY_{key_slot}.")
     return None
 
 
 def call_llm_json(role: str, messages: list, **kwargs) -> Optional[dict]:
+    """call_llm with json_mode=True and auto-parsing. Repairs truncated JSON."""
     raw = call_llm(role, messages, json_mode=True, **kwargs)
     if raw is None:
         return None
@@ -238,6 +244,7 @@ def call_llm_json(role: str, messages: list, **kwargs) -> Optional[dict]:
 
 
 def _repair_truncated_json(raw: str) -> Optional[list]:
+    """Extract complete JSON objects from a truncated array response."""
     raw = raw.strip()
     if not raw.startswith("["):
         return None
