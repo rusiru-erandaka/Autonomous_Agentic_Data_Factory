@@ -64,19 +64,19 @@ def print_banner():
 
 
 def _print_key_assignment():
-    """Show which API key handles each stage — helps verify rotation is correct."""
+    """Show which API key handles each stage — helps verify keys are loaded."""
     print("\n📋 API Key Assignment:")
-    assignments = [
-        ("Stage 1 — Task Generation",  "OPENROUTER_API_KEY_1", "~8 req/day"),
-        ("Stage 2 — Agent Execution",  "OPENROUTER_API_KEY_2", "~48 req/day ← heaviest"),
-        ("Stage 3 — Labeling",         "OPENROUTER_API_KEY_3", "~24 req/day"),
-        ("Stage 4 — Quality Gate",     "no LLM calls",         "0 req/day"),
-        ("Stage 5 — HF Upload",        "no LLM calls",         "0 req/day"),
+    llm_stages = [
+        ("Stage 1 — Task Gen + Secondary Label", "OPENROUTER_API_KEY_1", "~8 gen + ~12 secondary = ~20 req/day"),
+        ("Stage 2 — Agent Execution",            "OPENROUTER_API_KEY_2", "~48 req/day  ← heaviest"),
+        ("Stage 3 — Primary Labeling",           "OPENROUTER_API_KEY_3", "~12 req/day"),
     ]
-    for stage, key_name, budget in assignments:
-        val = os.environ.get(key_name, "")
+    for stage, key_name, budget in llm_stages:
+        val    = os.environ.get(key_name, "")
         status = f"{val[:16]}..." if val and not val.startswith("sk-or-v1-replace") else "❌ NOT SET"
-        print(f"   {stage:<30} {key_name} = {status}  ({budget})")
+        print(f"   {stage:<32} {key_name} = {status}  ({budget})")
+    print(f"   {'Stage 4 — Quality Gate':<32} pure Python — no LLM calls  (0 req/day)")
+    print(f"   {'Stage 5 — HF Upload':<32} pure Python — no LLM calls  (0 req/day)")
     print()
 
 
