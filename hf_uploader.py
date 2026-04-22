@@ -23,59 +23,99 @@ def _get_dataset_repo() -> str:
 
 
 def flatten_record(record: dict) -> dict:
-    """Flatten nested trace record into a single-row dict."""
+    """Flatten nested trace record into a single-row dict for HuggingFace."""
     trace_scores = record["labels"]["trace_level_scores"]
     meta         = record.get("metadata", {})
 
-    tc  = trace_scores.get("task_completion", 0) or 0
-    tue = trace_scores.get("tool_use_efficiency", 0) or 0
-    rc  = trace_scores.get("reasoning_coherence", 0) or 0
+    tc  = int(trace_scores.get("task_completion",    0) or 0)
+    tue = int(trace_scores.get("tool_use_efficiency", 0) or 0)
+    rc  = int(trace_scores.get("reasoning_coherence", 0) or 0)
+
+    # Always compute reward — never NULL
     reward_computed = round((tc / 3 * 0.4) + (tue / 3 * 0.3) + (rc / 3 * 0.3), 4)
 
+    # Use labeler's reward_signal if available, otherwise use computed value
+    reward_signal_raw = trace_scores.get("reward_signal")
+    reward_signal = round(float(reward_signal_raw), 4) if isinstance(reward_signal_raw, (int, float)) else reward_computed
+
+    # Normalize overall_quality to 0-10 range
+    oq_raw = trace_scores.get("overall_quality", 5.0)
+    oq = float(oq_raw) if isinstance(oq_raw, (int, float)) else 5.0
+    overall_quality = round(min(oq / 12 * 10, 10.0) if oq > 10 else min(oq, 10.0), 2)
+
+    # Real agent model name
+    agent_model = meta.get("agent_model", "unknown")
+
+    # Agreement score
+    agreement = record["labels"].get("agreement_score")
+
+    # Niche from task (may be set by template or LLM)
+    task_niche = (
+        record["task"].get("niche") or
+        record["task"].get("task_niche") or
+        "api_orchestration+code_agent"
+    )
+
     return {
+        # ── Identity ──────────────────────────────────────────────────────────
         "trace_id":                  record.get("trace_id", ""),
         "created_at":                record.get("created_at", ""),
+
+        # ── Task ──────────────────────────────────────────────────────────────
         "task":                      record["task"]["task"],
         "task_difficulty":           record["task"].get("difficulty", ""),
-        "task_niche":                record["task"].get("niche", "api_orchestration+code_agent"),
+        "task_niche":                task_niche,
         "expected_tools":            json.dumps(record["task"].get("expected_tools", [])),
         "likely_failure_points":     json.dumps(record["task"].get("likely_failure_points", [])),
         "freshness_source":          record["task"].get("freshness_source", ""),
         "generation_strategy":       record["task"].get("generation_strategy", ""),
+
+        # ── Trace ─────────────────────────────────────────────────────────────
         "trace_json":                json.dumps(record.get("trace", [])),
+
+        # ── Outcome ───────────────────────────────────────────────────────────
         "outcome_status":            record["outcome"]["status"],
-        "total_steps":               record["outcome"]["total_steps"],
-        "total_tool_calls":          record["outcome"]["total_tool_calls"],
+        "total_steps":               int(record["outcome"]["total_steps"]),
+        "total_tool_calls":          int(record["outcome"]["total_tool_calls"]),
         "tools_used":                json.dumps(record["outcome"].get("tools_used", [])),
         "failure_occurred":          bool(record["outcome"]["failure_occurred"]),
         "failure_reason":            record["outcome"].get("failure_reason") or "",
         "final_answer":              record["outcome"].get("final_answer") or "",
-        "duration_seconds":          record["outcome"].get("duration_seconds", 0),
+        "duration_seconds":          float(record["outcome"].get("duration_seconds", 0)),
+
+        # ── Labels ────────────────────────────────────────────────────────────
         "labeler_model":             record["labels"]["labeler_model"],
+        "labeler_model_2":           record["labels"].get("labeler_model_2", ""),
         "constitution_version":      record["labels"]["constitution_version"],
         "labeled_at":                record["labels"]["labeled_at"],
         "step_level_scores":         json.dumps(record["labels"].get("step_level_scores", [])),
-        "task_completion":           int(tc),
-        "tool_use_efficiency":       int(tue),
-        "reasoning_coherence":       int(rc),
-        "safety_compliance":         int(trace_scores.get("safety_compliance", 0) or 0),
-        "overall_quality":           float(trace_scores.get("overall_quality", 0) or 0),
-        # reward_signal IS reward_computed — single formula, no inconsistency
-        # formula: (task_completion*0.4 + tool_use_efficiency*0.3 + reasoning_coherence*0.3) / 3
-        "reward_signal":             reward_computed,
+        "primary_trace_scores":      json.dumps(record["labels"].get("primary_trace_scores", {})),
+        "secondary_trace_scores":    json.dumps(record["labels"].get("secondary_trace_scores", {})),
+
+        # ── Scores ────────────────────────────────────────────────────────────
+        "task_completion":           tc,
+        "tool_use_efficiency":       tue,
+        "reasoning_coherence":       rc,
+        "safety_compliance":         int(trace_scores.get("safety_compliance", 3) or 3),
+        "overall_quality":           overall_quality,
+        "reward_signal":             reward_signal,
+        "reward_computed":           reward_computed,   # NEVER NULL — always computed from formula
         "reward_formula":            "task_completion*0.4 + tool_use_efficiency*0.3 + reasoning_coherence*0.3 (each /3)",
-        "labeler_model_2":           "qwen/qwen3-next-80b-a3b-instruct:free",  # secondary labeler
         "supervisor_verdict":        trace_scores.get("supervisor_verdict", ""),
-        "verdict_reason":            trace_scores.get("verdict_reason", ""),
+        "verdict_reason":            trace_scores.get("verdict_reason", "") or "",
         "dual_labeled":              bool(record["labels"].get("dual_labeled", False)),
-        "agent_framework":           meta.get("agent_framework", ""),
-        "agent_model":               meta.get("agent_model", ""),
+        "agreement_score":           float(agreement) if isinstance(agreement, (int, float)) else None,
+        "conflict_flag":             bool(record["labels"].get("conflict_flag", False)),
+
+        # ── Metadata ──────────────────────────────────────────────────────────
+        "agent_framework":           meta.get("agent_framework", "react"),
+        "agent_model":               agent_model,
         "agent_temperature":         float(meta.get("agent_temperature", 0.4)),
         "prompt_template_version":   meta.get("prompt_template_version", ""),
         "token_count_input":         int(meta.get("token_count_input", 0)),
         "token_count_output":        int(meta.get("token_count_output", 0)),
         "world_context_date":        meta.get("world_context_date", ""),
-        "schema_version":            meta.get("schema_version", "v1.1"),
+        "schema_version":            meta.get("schema_version", "v2.0"),
     }
 
 

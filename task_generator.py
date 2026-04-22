@@ -71,24 +71,103 @@ TASK_TEMPLATES = [
     },
 ]
 
+# ── Extended niche templates for dataset diversity ────────────────────────────
+NICHE_TEMPLATES = [
+    # Data analysis niche
+    {
+        "id": "data_analysis_001",
+        "niche": "data_analysis",
+        "pattern": "Analyze {data_source} data to find {insight_type} and generate a {output_format} report.",
+        "slots": {
+            "data_source":   ["sales CSV", "user activity logs", "API response JSON", "database query results"],
+            "insight_type":  ["trends over time", "top performing segments", "anomalies", "correlations"],
+            "output_format": ["summary", "visualization-ready JSON", "markdown", "structured table"],
+        },
+        "difficulty": "medium",
+        "expected_tools": ["code_executor", "api_fetch", "file_read"],
+        "likely_failure_points": ["malformed data", "missing columns", "wrong data types"],
+    },
+    # File system niche
+    {
+        "id": "file_system_001",
+        "niche": "file_system_agent",
+        "pattern": "Search {location} for {file_type} files matching {criteria}, then {action}.",
+        "slots": {
+            "location":  ["the project directory", "uploaded documents", "a given folder path"],
+            "file_type": ["Python", "JSON config", "CSV", "log"],
+            "criteria":  ["errors in last 24h", "size > 1MB", "containing keyword 'TODO'"],
+            "action":    ["summarize findings", "move to archive", "extract key fields", "generate report"],
+        },
+        "difficulty": "medium",
+        "expected_tools": ["file_search", "file_read", "code_executor"],
+        "likely_failure_points": ["file not found", "permission denied", "encoding errors"],
+    },
+    # Web scraping niche
+    {
+        "id": "web_scraping_001",
+        "niche": "web_scraping",
+        "pattern": "Scrape {target} to extract {data_type}, handle {edge_case}, and store results in {destination}.",
+        "slots": {
+            "target":       ["a product listing page", "a GitHub repo's open issues", "a news feed", "an API docs page"],
+            "data_type":    ["pricing data", "issue titles and labels", "article summaries", "endpoint descriptions"],
+            "edge_case":    ["pagination", "rate limiting", "missing fields", "dynamic content"],
+            "destination":  ["a JSON file", "an Airtable base", "a Slack message", "a Notion page"],
+        },
+        "difficulty": "complex",
+        "expected_tools": ["web_search", "api_fetch", "airtable_api", "file_edit"],
+        "likely_failure_points": ["anti-bot protection", "schema changes", "timeout"],
+    },
+    # Debugging niche
+    {
+        "id": "debugging_001",
+        "niche": "debugging",
+        "pattern": "Debug why {component} produces {error} when {condition}. Write a fix and verify it works.",
+        "slots": {
+            "component":  ["the API client", "the data parser", "the webhook handler", "the retry logic"],
+            "error":      ["a KeyError", "a 500 response", "a silent failure", "wrong output format"],
+            "condition":  ["given malformed input", "under high load", "with missing env vars", "after auth refresh"],
+        },
+        "difficulty": "complex",
+        "expected_tools": ["code_search", "code_executor", "web_search", "file_edit"],
+        "likely_failure_points": ["root cause misidentified", "fix breaks other tests", "env-specific issue"],
+    },
+    # Multi-step planning niche
+    {
+        "id": "planning_001",
+        "niche": "multi_step_planning",
+        "pattern": "Plan and execute a {goal} workflow that involves {step_count} sequential steps with {constraint}.",
+        "slots": {
+            "goal":        ["data migration", "automated reporting", "onboarding automation", "incident response"],
+            "step_count":  ["3", "4", "5"],
+            "constraint":  ["rollback on failure", "idempotency", "rate limit compliance", "audit logging"],
+        },
+        "difficulty": "complex",
+        "expected_tools": ["api_fetch", "api_write", "code_executor", "logger", "notification"],
+        "likely_failure_points": ["step ordering", "partial completion", "rollback failure"],
+    },
+]
+
+
 import random
 
 def generate_template_tasks(count: int = 40) -> list[dict]:
-    """Fill template slots randomly to generate structured tasks."""
+    """Fill template slots from both standard and niche templates."""
+    all_templates = TASK_TEMPLATES + NICHE_TEMPLATES
     tasks = []
     for _ in range(count):
-        template = random.choice(TASK_TEMPLATES)
+        template = random.choice(all_templates)
         filled = template["pattern"]
         for slot, options in template["slots"].items():
             filled = filled.replace(f"{{{slot}}}", random.choice(options))
 
         tasks.append({
-            "task":                 filled,
-            "difficulty":          template["difficulty"],
-            "expected_tools":      template["expected_tools"],
+            "task":                  filled,
+            "difficulty":            template["difficulty"],
+            "niche":                 template.get("niche", "api_orchestration+code_agent"),
+            "expected_tools":        template["expected_tools"],
             "likely_failure_points": template["likely_failure_points"],
-            "generation_strategy": "template_based",
-            "freshness_source":    "template_library",
+            "generation_strategy":   "template_based",
+            "freshness_source":      "template_library",
         })
     return tasks
 

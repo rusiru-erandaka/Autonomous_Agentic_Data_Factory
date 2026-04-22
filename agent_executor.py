@@ -16,6 +16,17 @@ from datetime import datetime
 from typing import Optional
 from openrouter_client import call_llm
 
+_FAILURE_MODES = [
+    {"error": "wrong_tool_chosen",       "message": "Tool does not match task requirements"},
+    {"error": "correct_tool_wrong_args", "message": "Missing required argument: 'limit'"},
+    {"error": "hallucinated_result",     "message": "Tool returned unexpected schema"},
+    {"error": "rate_limit_exceeded",     "message": "429 Too Many Requests — retry after 60s"},
+    {"error": "auth_failure",            "message": "401 Unauthorized — invalid API key"},
+    {"error": "timeout",                 "message": "Request timed out after 30s"},
+    {"error": "infinite_loop_detected",  "message": "Agent repeated same action 3 times"},
+    {"error": "safety_violation",        "message": "Action blocked — destructive operation on production data"},
+]
+
 PROMPT_TEMPLATE_VERSION = "v2.0"
 
 # ── Agent model pool for diversity ────────────────────────────────────────────
@@ -132,11 +143,7 @@ def _auto_mock(tool_name: str, tool_input: dict) -> dict:
 
 def simulate_tool_call(tool_name: str, tool_input: dict, task: str, inject_failure: bool = False) -> dict:
     if inject_failure:
-        return random.choice([
-            {"error": "429 Too Many Requests", "retry_after": 60},
-            {"error": "401 Unauthorized", "message": "Invalid API key"},
-            {"error": "422 Unprocessable", "message": "Missing required field"},
-        ])
+        return random.choice(_FAILURE_MODES)
     registry = _make_tool_registry(task)
     handler  = registry.get(tool_name, lambda i: _auto_mock(tool_name, i))
     result   = handler(tool_input)
@@ -190,6 +197,16 @@ def run_agent_on_task(task: dict, force_success: bool = False) -> dict:
     output_tokens   = 0
     start_time      = time.time()
     failure_rate    = 0.0 if force_success else 0.15
+
+    # Failure mode pool for diversity
+    _failure_modes = [
+        {"error": "wrong_tool_chosen", "message": "Tool does not match task requirements"},
+        {"error": "correct_tool_wrong_args", "message": "Missing required argument: 'limit'"},
+        {"error": "hallucinated_result", "message": "Tool returned unexpected schema"},
+        {"error": "rate_limit_exceeded", "message": "429 Too Many Requests — retry after 60s"},
+        {"error": "auth_failure", "message": "401 Unauthorized — invalid API key"},
+        {"error": "timeout", "message": "Request timed out after 30s"},
+    ]
 
     for step_num in range(1, 5):
         raw = call_llm(model_role, messages, temperature=temp, max_tokens=600)
@@ -247,6 +264,17 @@ def run_agent_on_task(task: dict, force_success: bool = False) -> dict:
             messages.append({"role": "user", "content": "Continue with the next step."})
 
     duration_s = round(time.time() - start_time, 2)
+
+    # Validate success: agent must have made tool calls AND have a final answer
+    # Prevents hallucination-only runs from being labeled "success"
+    if outcome_status == "success":
+        if len(tool_calls_made) == 0 and not final_answer:
+            outcome_status = "failed"
+            failure_reason = "hallucinated_completion"
+        elif len(tool_calls_made) == 0:
+            outcome_status = "partial"
+            failure_reason = "no_tool_calls_made"
+
     if outcome_status != "success":
         has_tool_error = any("error" in str(s.get("result","")) for s in steps if s.get("type") == "tool_call")
         outcome_status = "partial" if (has_tool_error or len(tool_calls_made) > 0) else "failed"
@@ -270,7 +298,7 @@ def run_agent_on_task(task: dict, force_success: bool = False) -> dict:
         },
         "metadata": {
             "agent_framework":         "react",
-            "agent_model":             f"{model_role}-{AGENT_MODELS[0][0]}",
+            "agent_model":             {"agent": "nvidia/nemotron-3-super-120b-a12b", "agent_backup": "openai/gpt-oss-120b"}.get(model_role, model_role),
             "agent_temperature":       temp,
             "prompt_template_version": PROMPT_TEMPLATE_VERSION,
             "token_count_input":       int(input_tokens),
