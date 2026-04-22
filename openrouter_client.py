@@ -53,12 +53,13 @@ MODELS = {
 # ── Role → which API key to use ───────────────────────────────────────────────
 # Roles are assigned to keys based on which pipeline stage they belong to.
 ROLE_TO_KEY_SLOT = {
-    "generator":    1,   # Stage 1 → KEY_1
-    "quality_gate": 1,   # Stage 1 utility → KEY_1
-    "agent":        2,   # Stage 2 → KEY_2
-    "agent_backup": 2,   # Stage 2 fallback → KEY_2
-    "labeler":      3,   # Stage 3 → KEY_3
-    "secondary":    3,   # Stage 3 secondary → KEY_3
+    "generator":    1,   # Stage 1 — Task Generation → KEY_1
+    "quality_gate": 1,   # Stage 1 utility           → KEY_1
+    "agent":        2,   # Stage 2 — Agent Execution → KEY_2
+    "agent_backup": 2,   # Stage 2 fallback          → KEY_2
+    "labeler":      3,   # Stage 3 — Labeling        → KEY_3
+    # "secondary" removed — both labelers on same key caused 429 cascades.
+    # Re-enable when you have paid credits (1000 req/day per key).
 }
 
 # ── Rate limit config ──────────────────────────────────────────────────────────

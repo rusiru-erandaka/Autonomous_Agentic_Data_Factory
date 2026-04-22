@@ -226,78 +226,59 @@ def merge_labels(primary_scores: dict, secondary_scores: dict) -> dict:
 
 def label_traces(traces: list[dict]) -> list[dict]:
     """
-    Label all traces with primary labeler.
-    Secondary labeler runs on 50% of traces to keep KEY_3 under rate limits.
-    Both use KEY_3 — a pause between primary and secondary prevents 429.
+    Label all traces with a SINGLE labeler call per trace.
 
-    Per-trace budget on KEY_3:
-      Every trace:   1 primary call
-      50% of traces: 1 secondary call
-      7 traces → ~10-11 calls total on KEY_3 — well under 50/day and 20/min
+    Secondary labeling removed — reasons:
+    1. Both labelers share KEY_3, so primary + secondary = 2× calls on same key
+    2. This reliably triggers per-minute 429s even with pauses
+    3. One high-quality labeler (Trinity) is better than two that cause failures
+    4. Re-enable secondary when you have paid credits (1000 req/day)
+
+    KEY_3 budget: 1 call per trace = ~12 calls/day — well under 50 req/day limit
     """
-    import random as _random
     labeled = []
     total   = len(traces)
-
-    # Run secondary on 50% of traces — enough for agreement stats, halves KEY_3 load
-    secondary_indices = set(_random.sample(range(total), max(1, total // 2)))
-
-    print(f"\n🏷️  Labeling {total} traces "
-          f"(primary on all, secondary on {len(secondary_indices)})...")
+    print(f"\n🏷️  Labeling {total} traces (1 call per trace on KEY_3)...")
 
     for idx, trace in enumerate(traces):
         print(f"  [{idx+1}/{total}] Labeling trace {trace.get('trace_id', '')}...")
 
-        # ── Primary label ──────────────────────────────────────────────────────
+        # ── Single labeler call — scores all steps + trace level ───────────────
         primary_steps, primary_scores = label_trace_primary(trace)
+
         if primary_scores is None:
             primary_scores = {
                 "task_completion": 1, "tool_use_efficiency": 1,
                 "reasoning_coherence": 1, "safety_compliance": 3,
                 "overall_quality": 5.0, "reward_signal": 0.5,
                 "supervisor_verdict": "flag",
-                "verdict_reason": "primary_label_unavailable",
+                "verdict_reason": "labeling_unavailable — flagged for manual review",
             }
 
-        # ── Secondary label (only on selected traces) ──────────────────────────
-        secondary_steps  = []
-        secondary_scores = {}
-        agreement        = None
-
-        if idx in secondary_indices:
-            # Small pause between primary and secondary on same key
-            # (_enforce_rate_limit in openrouter_client handles the 6s gap,
-            #  but an extra pause reduces burst pressure on KEY_3)
-            time.sleep(3)
-            secondary_steps, sec_scores = label_trace_secondary(trace)
-            if sec_scores:
-                secondary_scores = sec_scores
-                agreement = compute_agreement(primary_scores, secondary_scores)
-
-        # ── Merge scores ───────────────────────────────────────────────────────
-        final_scores = merge_labels(primary_scores, secondary_scores)
+        # Compute reward from documented formula
+        tc  = primary_scores.get("task_completion", 0) or 0
+        tue = primary_scores.get("tool_use_efficiency", 0) or 0
+        rc  = primary_scores.get("reasoning_coherence", 0) or 0
+        reward_computed = round((tc / 3 * 0.4) + (tue / 3 * 0.3) + (rc / 3 * 0.3), 4)
+        primary_scores["reward_computed"] = reward_computed
 
         trace["labels"] = {
-            "labeler_model":           "arcee-ai/trinity-large-preview",
-            "secondary_labeler_model": "qwen/qwen3-next-80b-a3b-instruct",
-            "constitution_version":    "v1.2",
-            "labeled_at":              datetime.now().strftime("%Y-%m-%d"),
-            "step_level_scores":       primary_steps,
-            "secondary_step_scores":   secondary_steps,
-            "trace_level_scores":      final_scores,
-            "primary_trace_scores":    primary_scores,
-            "secondary_trace_scores":  secondary_scores,
-            "dual_labeled":            idx in secondary_indices,
-            "agreement_score":         agreement,
-            "conflict_flag":           (agreement < 0.75) if agreement is not None else False,
+            "labeler_model":        "arcee-ai/trinity-large-preview",
+            "constitution_version": "v1.2",
+            "labeled_at":           datetime.now().strftime("%Y-%m-%d"),
+            "step_level_scores":    primary_steps,
+            "trace_level_scores":   primary_scores,
+            "dual_labeled":         False,
+            "agreement_score":      None,
+            "conflict_flag":        False,
         }
         labeled.append(trace)
 
-    approved  = sum(1 for t in labeled if t["labels"]["trace_level_scores"].get("supervisor_verdict") == "approve")
-    conflicts = sum(1 for t in labeled if t["labels"].get("conflict_flag", False))
-    dual_count = sum(1 for t in labeled if t["labels"].get("dual_labeled", False))
-    print(f"  ✅ Labeling complete: approved={approved}/{total}, "
-          f"dual_labeled={dual_count}, conflicts={conflicts}")
+    approved = sum(
+        1 for t in labeled
+        if t["labels"]["trace_level_scores"].get("supervisor_verdict") == "approve"
+    )
+    print(f"  ✅ Labeling complete: approved={approved}/{total}")
     return labeled
 
 def label_trace_single_call(trace: dict) -> tuple[list, dict, dict]:
