@@ -40,10 +40,10 @@ MODELS = {
 
     # Stage 2: Agent execution (strongest free model for best task solving)
     "agent":        "nvidia/nemotron-3-super-120b-a12b:free",
-    "agent_backup": "openai/gpt-oss-120b:free",
+    "agent_backup": "nvidia/nemotron-nano-9b-v2:free",
 
     # Stage 3: Labeling (two different models for genuine dual-label)
-    "labeler":      "arcee-ai/trinity-large-preview:free",
+    "labeler":      "meta-llama/llama-3.3-70b-instruct:free",
     "secondary":    "qwen/qwen3-next-80b-a3b-instruct:free",
 
     # Utility (uses KEY_1 by default)
