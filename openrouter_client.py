@@ -40,10 +40,10 @@ MODELS = {
 
     # Stage 2: Agent execution (strongest free model for best task solving)
     "agent":        "nvidia/nemotron-3-super-120b-a12b:free",
-    "agent_backup": "nvidia/nemotron-nano-9b-v2:free",
+    "agent_backup": "minimax/minimax-m2.5:free",
 
     # Stage 3: Labeling (two different models for genuine dual-label)
-    "labeler":      "meta-llama/llama-3.3-70b-instruct:free",
+    "labeler":      "qwen/qwen3-coder:free",
     "secondary":    "qwen/qwen3-next-80b-a3b-instruct:free",
 
     # Utility (uses KEY_1 by default)
