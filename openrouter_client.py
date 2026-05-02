@@ -40,14 +40,14 @@ MODELS = {
 
     # Stage 2: Agent execution (strongest free model for best task solving)
     "agent":        "nvidia/nemotron-3-super-120b-a12b:free",
-    "agent_backup": "minimax/minimax-m2.5:free",
+    "agent_backup": "nvidia/nemotron-3-super-120b-a12b:free",
 
     # Stage 3: Labeling (two different models for genuine dual-label)
-    "labeler":      "qwen/qwen3-coder:free",
-    "secondary":    "qwen/qwen3-next-80b-a3b-instruct:free",
+    "labeler":      "nvidia/nemotron-3-super-120b-a12b:free",
+    "secondary":    "nvidia/nemotron-3-super-120b-a12b:free",
 
     # Utility (uses KEY_1 by default)
-    "quality_gate": "minimax/minimax-m2.5:free",
+    "quality_gate": "nvidia/nemotron-3-super-120b-a12b:free",
 }
 
 # ── Role → which API key to use ───────────────────────────────────────────────

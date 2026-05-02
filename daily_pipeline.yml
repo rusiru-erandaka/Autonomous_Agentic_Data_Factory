@@ -1,32 +1,22 @@
-# .github/workflows/daily_pipeline.yml
-#
-# Runs the dataset pipeline every day at 2:00 AM UTC.
-# Also allows manual trigger from the GitHub Actions tab.
-#
-# Required secrets (set in repo Settings → Secrets → Actions):
-#   OPENROUTER_API_KEY  — your OpenRouter API key
-#   HF_TOKEN            — HuggingFace write token
-#   GH_PAT              — GitHub Personal Access Token (read:repo scope)
-
 name: Daily Dataset Pipeline
 
 on:
   schedule:
-    - cron: '0 2 * * *'   # every day at 02:00 UTC
+    - cron: '0 2 * * *'   # 02:00 UTC daily
   workflow_dispatch:        # manual trigger from GitHub UI
     inputs:
       task_target:
-        description: 'Number of tasks to generate (default 50)'
+        description: 'Number of tasks to generate'
         required: false
-        default: '50'
+        default: '18'
 
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
-    timeout-minutes: 120     # 2 hour hard limit
+    timeout-minutes: 180   # 3hr hard limit
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Python 3.11
@@ -39,31 +29,34 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Create registry directory
-        run: mkdir -p pipeline/registry
+        run: mkdir -p registry
 
       - name: Run pipeline
         env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          HF_TOKEN:           ${{ secrets.HF_TOKEN }}
-          GITHUB_TOKEN:       ${{ secrets.GH_PAT }}
-          HF_DATASET_REPO:    ${{ vars.HF_DATASET_REPO }}
-          DAILY_TASK_TARGET:  ${{ github.event.inputs.task_target || '50' }}
-          RUN_ONCE:           "true"
-        working-directory: pipeline
+          GROQ_API_KEY:          ${{ secrets.GROQ_API_KEY }}
+          GOOGLE_API_KEY:        ${{ secrets.GOOGLE_API_KEY }}
+          OPENROUTER_API_KEY_1:  ${{ secrets.OPENROUTER_API_KEY_1 }}
+          OPENROUTER_API_KEY_2:  ${{ secrets.OPENROUTER_API_KEY_2 }}
+          OPENROUTER_API_KEY_3:  ${{ secrets.OPENROUTER_API_KEY_3 }}
+          HF_TOKEN:              ${{ secrets.HF_TOKEN }}
+          HF_DATASET_REPO:       ${{ vars.HF_DATASET_REPO }}
+          GITHUB_TOKEN:          ${{ secrets.GH_PAT }}
+          DAILY_TASK_TARGET:     ${{ github.event.inputs.task_target || '18' }}
+          RUN_ONCE:              "true"
         run: python main.py
 
-      - name: Upload run logs as artifact
-        if: always()   # upload even if pipeline had errors
+      - name: Upload run logs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: pipeline-logs-${{ github.run_number }}
-          path: pipeline/registry/run_*.json
+          path: registry/run_*.json
           retention-days: 30
 
-      - name: Upload local batch backup
+      - name: Upload batch backups
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: batch-backup-${{ github.run_number }}
-          path: pipeline/registry/batch_*.jsonl
+          path: registry/batch_*.jsonl
           retention-days: 30
