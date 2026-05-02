@@ -1,11 +1,11 @@
 """
 task_sources.py
-Pulls REAL real-world signals daily.
+Real-world signal collection with quality filtering.
 
-Key fixes:
-- Deduplication by URL/ID so same GitHub issue never appears twice
-- Relevance pre-filter before returning signals
-- Each signal carries enough context to generate a non-duplicate task
+Fixes:
+- GitHub: scrapes full issue body (1000 chars), filters for bug/help-wanted labels
+- Dedup: signals marked seen only AFTER successful task creation
+- Relevance: stronger keyword filter before returning signals
 """
 
 import os
@@ -19,8 +19,7 @@ from bs4 import BeautifulSoup
 
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 
-# ── Seen-signal registry (SQLite) ─────────────────────────────────────────────
-_SEEN_DB = os.path.join(os.path.dirname(__file__), "registry", "seen_signals.db")
+_SEEN_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "registry", "seen_signals.db")
 
 def _init_seen_db():
     os.makedirs(os.path.dirname(_SEEN_DB), exist_ok=True)
@@ -49,30 +48,36 @@ def _mark_seen(sig_id: str):
         pass
 
 def _sig_id(source: str, text: str) -> str:
-    """Stable ID for dedup — based on source URL + first 100 chars of text."""
-    return hashlib.md5(f"{source}::{text[:100]}".encode()).hexdigest()
+    return hashlib.md5(f"{source}::{text[:120]}".encode()).hexdigest()
 
+def mark_signal_used(signal: dict):
+    """Call AFTER signal is successfully converted to an approved task."""
+    sig_id = signal.get("_sig_id")
+    if sig_id:
+        _mark_seen(sig_id)
 
-# ── Relevance keywords ────────────────────────────────────────────────────────
 RELEVANT_KEYWORDS = [
     "api", "agent", "tool", "webhook", "endpoint", "request", "response",
     "code", "script", "debug", "error", "fix", "implement", "integrate",
     "stripe", "notion", "github", "slack", "airtable", "openai", "langchain",
     "crewai", "autogen", "llm", "function", "async", "timeout", "retry",
+    "bug", "exception", "traceback", "import", "module", "client", "auth",
 ]
 
 def _is_relevant(text: str) -> bool:
     t = text.lower()
     return any(k in t for k in RELEVANT_KEYWORDS)
 
+# ── GitHub Issues ──────────────────────────────────────────────────────────────
+# Focus on bug/help-wanted issues — these have concrete problems to solve
 
-# ── GitHub Issues ─────────────────────────────────────────────────────────────
 GITHUB_REPOS = [
-    ("langchain-ai/langchain",   "agent"),
-    ("crewAIInc/crewAI",         "bug"),
-    ("microsoft/autogen",        "enhancement"),
-    ("openai/openai-python",     "question"),
-    ("run-llama/llama_index",    "agent"),
+    ("langchain-ai/langchain",  ["bug", "help wanted"]),
+    ("crewAIInc/crewAI",        ["bug", "help wanted"]),
+    ("microsoft/autogen",       ["bug", "help wanted"]),
+    ("openai/openai-python",    ["bug", "question"]),
+    ("run-llama/llama_index",   ["bug", "help wanted"]),
+    ("BerriAI/litellm",         ["bug", "help wanted"]),
 ]
 
 def fetch_github_issues(max_per_repo: int = 8) -> list[dict]:
@@ -80,58 +85,88 @@ def fetch_github_issues(max_per_repo: int = 8) -> list[dict]:
     results = []
     headers = {"Authorization": f"Bearer {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
 
-    for repo, label in GITHUB_REPOS:
-        try:
-            resp = requests.get(
-                f"https://api.github.com/repos/{repo}/issues",
-                headers=headers,
-                params={"labels": label, "state": "open",
-                        "per_page": max_per_repo, "sort": "created", "direction": "desc"},
-                timeout=15,
-            )
-            if resp.status_code != 200:
-                continue
-            for issue in resp.json():
-                if not isinstance(issue, dict):
-                    continue
-                source = f"github:{repo}#{issue['number']}"
-                title  = (issue.get("title") or "").strip()
-                body   = (issue.get("body") or "")[:500].strip()
-                text   = f"{title}\n{body}"
+    for repo, preferred_labels in GITHUB_REPOS:
+        fetched = []
+        # Try preferred labels first, then open issues without label filter
+        label_attempts = [",".join(preferred_labels), ""]
+        for label_str in label_attempts:
+            if len(fetched) >= max_per_repo:
+                break
+            try:
+                params = {
+                    "state":     "open",
+                    "per_page":  max_per_repo,
+                    "sort":      "created",
+                    "direction": "desc",
+                }
+                if label_str:
+                    params["labels"] = label_str
 
-                if not _is_relevant(text):
+                resp = requests.get(
+                    f"https://api.github.com/repos/{repo}/issues",
+                    headers=headers, params=params, timeout=15,
+                )
+                if resp.status_code != 200:
                     continue
-                sig = _sig_id(source, text)
-                if _is_seen(sig):
-                    continue
-                results.append({
-                    "raw_text": text,
-                    "source":   source,
-                    "title":    title,
-                    "date":     issue["created_at"][:10],
-                    "_sig_id":  sig,
-                })
-            time.sleep(1)
-        except Exception as e:
-            print(f"  ⚠️  GitHub {repo}: {e}")
+
+                for issue in resp.json():
+                    if not isinstance(issue, dict):
+                        continue
+                    if issue.get("pull_request"):
+                        continue  # skip PRs
+
+                    source = f"github:{repo}#{issue['number']}"
+                    title  = (issue.get("title") or "").strip()
+
+                    # Use full body up to 1000 chars — contains error msgs + reproduction steps
+                    body   = (issue.get("body") or "")[:1000].strip()
+                    text   = f"{title}\n{body}"
+
+                    if not _is_relevant(text):
+                        continue
+                    sig = _sig_id(source, text)
+                    if _is_seen(sig):
+                        continue
+
+                    # Extract issue labels for metadata
+                    issue_labels = [l["name"] for l in issue.get("labels", [])]
+
+                    fetched.append({
+                        "raw_text":     text,
+                        "title":        title,
+                        "source":       source,
+                        "source_url":   issue.get("html_url", ""),
+                        "issue_labels": issue_labels,
+                        "date":         issue["created_at"][:10],
+                        "_sig_id":      sig,
+                    })
+                time.sleep(0.5)
+            except Exception as e:
+                print(f"  ⚠️  GitHub {repo}: {e}")
+
+        results.extend(fetched[:max_per_repo])
 
     print(f"  📦 GitHub: {len(results)} new signals")
     return results
 
+# ── Stack Overflow ─────────────────────────────────────────────────────────────
+SO_TAGS = [
+    "langchain", "openai-api", "stripe-api", "notion-api",
+    "github-api", "llm-agent", "autogen", "crewai", "litellm",
+]
 
-# ── Stack Overflow ────────────────────────────────────────────────────────────
-SO_TAGS = ["langchain", "openai-api", "stripe-api", "notion-api",
-           "github-api", "llm-agent", "autogen", "crewai"]
-
-def fetch_stackoverflow_questions(max_per_tag: int = 5) -> list[dict]:
+def fetch_stackoverflow_questions(max_per_tag: int = 4) -> list[dict]:
     _init_seen_db()
     results = []
     for tag in SO_TAGS:
         try:
             resp = requests.get(
                 "https://api.stackexchange.com/2.3/questions",
-                params={"order": "desc", "sort": "creation", "tagged": tag,
-                        "site": "stackoverflow", "pagesize": max_per_tag, "filter": "withbody"},
+                params={
+                    "order": "desc", "sort": "creation", "tagged": tag,
+                    "site": "stackoverflow", "pagesize": max_per_tag,
+                    "filter": "withbody",
+                },
                 timeout=15,
             )
             if resp.status_code != 200:
@@ -139,7 +174,7 @@ def fetch_stackoverflow_questions(max_per_tag: int = 5) -> list[dict]:
             for q in resp.json().get("items", []):
                 source = f"stackoverflow:{q['question_id']}"
                 title  = (q.get("title") or "").strip()
-                body   = BeautifulSoup(q.get("body", ""), "html.parser").get_text()[:400]
+                body   = BeautifulSoup(q.get("body", ""), "html.parser").get_text()[:600]
                 text   = f"{title}\n{body}"
 
                 if not _is_relevant(text):
@@ -148,23 +183,22 @@ def fetch_stackoverflow_questions(max_per_tag: int = 5) -> list[dict]:
                 if _is_seen(sig):
                     continue
                 results.append({
-                    "raw_text": text,
-                    "source":   source,
-                    "title":    title,
-                    "_sig_id":  sig,
-                    "date":     datetime.fromtimestamp(
+                    "raw_text":   text,
+                    "title":      title,
+                    "source":     source,
+                    "source_url": f"https://stackoverflow.com/q/{q['question_id']}",
+                    "date":       datetime.fromtimestamp(
                         q["creation_date"], tz=timezone.utc).strftime("%Y-%m-%d"),
+                    "_sig_id":    sig,
                 })
             time.sleep(1)
         except Exception as e:
-            print(f"  ⚠️  SO tag '{tag}': {e}")
-
+            print(f"  ⚠️  SO '{tag}': {e}")
     print(f"  📦 Stack Overflow: {len(results)} new signals")
     return results
 
-
-# ── HuggingFace Daily Papers ──────────────────────────────────────────────────
-def fetch_hf_daily_papers(max_papers: int = 8) -> list[dict]:
+# ── HuggingFace Papers ─────────────────────────────────────────────────────────
+def fetch_hf_daily_papers(max_papers: int = 6) -> list[dict]:
     _init_seen_db()
     results = []
     try:
@@ -177,28 +211,26 @@ def fetch_hf_daily_papers(max_papers: int = 8) -> list[dict]:
                 continue
             title   = title_el.get_text(strip=True)
             summary = summary_el.get_text(strip=True) if summary_el else ""
-            text    = f"{title}\n{summary[:300]}"
-
+            text    = f"{title}\n{summary[:400]}"
             if not _is_relevant(text):
                 continue
             sig = _sig_id("hf_papers", text)
             if _is_seen(sig):
                 continue
             results.append({
-                "raw_text": text,
-                "source":   "huggingface_papers",
-                "title":    title,
-                "_sig_id":  sig,
-                "date":     datetime.now().strftime("%Y-%m-%d"),
+                "raw_text":   text,
+                "title":      title,
+                "source":     "huggingface_papers",
+                "source_url": "https://huggingface.co/papers",
+                "date":       datetime.now().strftime("%Y-%m-%d"),
+                "_sig_id":    sig,
             })
     except Exception as e:
         print(f"  ⚠️  HF papers: {e}")
-
     print(f"  📦 HuggingFace Papers: {len(results)} new signals")
     return results
 
-
-# ── API Changelog RSS ─────────────────────────────────────────────────────────
+# ── API Changelogs ─────────────────────────────────────────────────────────────
 CHANGELOG_FEEDS = {
     "stripe": "https://stripe.com/blog/changelog.rss",
     "github": "https://github.blog/changelog/feed/",
@@ -212,30 +244,30 @@ def fetch_api_changelogs(max_per_feed: int = 3) -> list[dict]:
         try:
             feed = feedparser.parse(feed_url)
             for entry in feed.entries[:max_per_feed]:
-                summary = BeautifulSoup(entry.get("summary", ""), "html.parser").get_text()[:300]
-                text    = f"{entry.title}\n{summary}"
-                source  = f"{api_name}_changelog"
-
+                summary = BeautifulSoup(
+                    entry.get("summary", ""), "html.parser"
+                ).get_text()[:400]
+                text   = f"{entry.title}\n{summary}"
+                source = f"{api_name}_changelog"
                 if not _is_relevant(text):
                     continue
                 sig = _sig_id(source, text)
                 if _is_seen(sig):
                     continue
                 results.append({
-                    "raw_text": text,
-                    "source":   source,
-                    "title":    entry.title,
-                    "_sig_id":  sig,
-                    "date":     datetime.now().strftime("%Y-%m-%d"),
+                    "raw_text":   text,
+                    "title":      entry.title,
+                    "source":     source,
+                    "source_url": entry.get("link", ""),
+                    "date":       datetime.now().strftime("%Y-%m-%d"),
+                    "_sig_id":    sig,
                 })
         except Exception as e:
             print(f"  ⚠️  Changelog '{api_name}': {e}")
-
     print(f"  📦 API Changelogs: {len(results)} new signals")
     return results
 
-
-# ── Aggregator ────────────────────────────────────────────────────────────────
+# ── Aggregator ─────────────────────────────────────────────────────────────────
 def collect_all_signals() -> list[dict]:
     print("🌐 Collecting real-world signals...")
     signals = []
@@ -243,16 +275,5 @@ def collect_all_signals() -> list[dict]:
     signals += fetch_stackoverflow_questions()
     signals += fetch_hf_daily_papers()
     signals += fetch_api_changelogs()
-    print(f"  ✅ Total NEW signals (deduped): {len(signals)}")
+    print(f"  ✅ Total new signals: {len(signals)}")
     return signals
-
-
-def mark_signal_used(signal: dict):
-    """
-    Call this AFTER a signal has been successfully converted to an approved task.
-    Signals are only marked seen when actually used — never during collection.
-    This prevents signals from being permanently burned by failed/interrupted runs.
-    """
-    sig_id = signal.get("_sig_id")
-    if sig_id:
-        _mark_seen(sig_id)
