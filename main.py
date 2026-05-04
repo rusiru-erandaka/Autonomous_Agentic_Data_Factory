@@ -67,12 +67,12 @@ def _print_startup_info():
 
     print("\n📋 Provider & Key Assignment:")
     rows = [
-        ("Stage 1 — Task Generation",   "Groq",   "GROQ_API_KEY",    "generator / quality_gate", "~20 req/day"),
-        ("Stage 2 — Agent Execution",   "Groq",   "GROQ_API_KEY",    "agent / agent_backup",     "~72 req/day"),
-        ("Stage 3 — Primary Labeling",  "Google", "GOOGLE_API_KEY",  "labeler",                  "~18 req/day"),
-        ("Stage 3 — Secondary Label",   "Groq",   "GROQ_API_KEY",    "secondary",                "~18 req/day"),
-        ("Stage 4 — Quality Gate",      "—",      "—",               "pure Python",              "0 req/day"),
-        ("Stage 5 — HF Upload",         "—",      "HF_TOKEN",        "pure Python",              "0 req/day"),
+        ("Stage 1 — Task Generation",   "Groq",        "GROQ_API_KEY",  "generator / quality_gate", "~20 req/day"),
+        ("Stage 2 — Agent Execution",   "Groq",        "GROQ_API_KEY",  "agent / agent_backup",     "~72 req/day"),
+        ("Stage 3 — Primary Labeling",  "Groq",        "GROQ_API_KEY",  "labeler",                  "~18 req/day"),
+        ("Stage 3 — Secondary Label",   "Groq",        "GROQ_API_KEY",  "secondary",                "~18 req/day"),
+        ("Stage 4 — Quality Gate",      "—",           "—",             "pure Python",              "0 req/day"),
+        ("Stage 5 — HF Upload",         "—",           "HF_TOKEN",      "pure Python",              "0 req/day"),
     ]
     for stage, provider, key_name, roles, budget in rows:
         val    = os.environ.get(key_name, "") if key_name != "—" else "N/A"
@@ -86,8 +86,11 @@ def _print_startup_info():
         print(f"   [{role:<14}] {info['provider']:<8}: {pool_str}")
 
     # OpenRouter fallback status
-    or_keys = sum(1 for i in range(1, 4) if os.environ.get(f"OPENROUTER_API_KEY_{i}", ""))
-    print(f"\n   OpenRouter fallback: {or_keys}/3 keys set")
+    or_keys = sum(1 for i in range(1, 4) if os.environ.get(f"OPENROUTER_API_KEY_{i}", "").strip()
+                  and not os.environ.get(f"OPENROUTER_API_KEY_{i}", "").startswith("sk-or-v1-replace"))
+    groq_set = "✅" if os.environ.get("GROQ_API_KEY", "") else "❌ NOT SET"
+    print(f"\n   Groq API key: {groq_set}")
+    print(f"   OpenRouter fallback: {or_keys}/3 keys set")
     print()
 
 

@@ -1,23 +1,27 @@
 """
 llm_client.py
-Multi-provider LLM client supporting Groq, Google AI Studio, and OpenRouter.
+Multi-provider LLM client — Groq primary, OpenRouter fallback.
 
-Provider assignment per role:
-  generator    → Groq    (llama-3.1-8b-instant,   14.4K RPD, 30 RPM)
-  agent        → Groq    (llama-3.3-70b-versatile,  1K   RPD, 30 RPM)
-  agent_backup → Groq    (openai/gpt-oss-120b,      1K   RPD, 30 RPM)
-  labeler      → Google  (gemini-2.0-flash,         1.5K RPD, 15 RPM)
-  secondary    → Groq    (qwen/qwen3-32b,           1K   RPD, 60 RPM)
-  quality_gate → Groq    (llama-3.1-8b-instant,    14.4K RPD, 30 RPM)
+Google AI Studio removed — too many 429 issues on free tier.
 
-OpenRouter 3 keys (150 RPD total) = fallback pool only.
+Provider assignment:
+  All roles → Groq (primary)
+  All roles → OpenRouter (fallback, 3 keys × 50 req/day = 150 req/day)
 
-Error handling per error type:
-  429           → wait for per-minute reset, retry same model
-  401/402/403   → model moved to paid, try next in pool
-  502/503/504   → provider gateway issue, try next in pool
-  null content  → model unsuitable, try next in pool after 2 occurrences
-  timeout       → retry same model with backoff
+Groq free limits:
+  llama-3.3-70b-versatile    : 1K  RPD, 30 RPM
+  llama-3.1-8b-instant       : 14.4K RPD, 30 RPM
+  qwen/qwen3-32b             : 1K  RPD, 60 RPM
+  meta-llama/llama-4-scout   : 1K  RPD, 30 RPM
+  openai/gpt-oss-120b        : 1K  RPD, 30 RPM
+
+Role pools — tried top to bottom on failure:
+  generator    → 8b-instant (14.4K RPD, fast)
+  agent        → 70b-versatile (strongest reasoning)
+  agent_backup → gpt-oss-120b (different architecture)
+  labeler      → 70b-versatile (strong evaluation)
+  secondary    → qwen3-32b (60 RPM, different model for diversity)
+  quality_gate → 8b-instant (lightweight)
 """
 
 import os
@@ -26,16 +30,10 @@ import json
 import requests
 from typing import Optional
 
-# ── Provider base URLs ─────────────────────────────────────────────────────────
-GROQ_URL    = "https://api.groq.com/openai/v1/chat/completions"
-GOOGLE_URL  = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-OR_URL      = "https://openrouter.ai/api/v1/chat/completions"
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+OR_URL   = "https://openrouter.ai/api/v1/chat/completions"
 
-# ── Role → provider + model pool ──────────────────────────────────────────────
-# Each role has a PRIMARY provider and an ordered pool of models.
-# On failure the system tries the next model in the pool.
-# If the entire pool fails, it falls back to OpenRouter.
-
+# ── Role → model pool (Groq model IDs) ────────────────────────────────────────
 ROLE_CONFIG = {
     "generator": {
         "provider": "groq",
@@ -43,16 +41,15 @@ ROLE_CONFIG = {
             "llama-3.1-8b-instant",
             "llama-3.3-70b-versatile",
             "openai/gpt-oss-20b",
-            "openai/gpt-oss-120b",
         ],
         "rpm": 30,
     },
     "agent": {
         "provider": "groq",
         "models": [
-            "openai/gpt-oss-120b",
-            "openai/gpt-oss-20b",
+            "llama-3.3-70b-versatile",
             "meta-llama/llama-4-scout-17b-16e-instruct",
+            "openai/gpt-oss-120b",
         ],
         "rpm": 30,
     },
@@ -61,24 +58,25 @@ ROLE_CONFIG = {
         "models": [
             "openai/gpt-oss-120b",
             "llama-3.3-70b-versatile",
-            "openai/gpt-oss-20b",
+            "meta-llama/llama-4-scout-17b-16e-instruct",
         ],
         "rpm": 30,
     },
     "labeler": {
         "provider": "groq",
         "models": [
-            "openai/gpt-oss-20b",
-            #"gemini-1.5-flash",
+            "llama-3.3-70b-versatile",
+            "meta-llama/llama-4-scout-17b-16e-instruct",
+            "openai/gpt-oss-120b",
         ],
-        "rpm": 15,
+        "rpm": 30,
     },
     "secondary": {
         "provider": "groq",
         "models": [
             "qwen/qwen3-32b",
+            "llama-3.3-70b-versatile",
             "meta-llama/llama-4-scout-17b-16e-instruct",
-            "openai/gpt-oss-20b",
         ],
         "rpm": 60,
     },
@@ -92,7 +90,7 @@ ROLE_CONFIG = {
     },
 }
 
-# OpenRouter fallback pool — used only when primary provider fails entirely
+# ── OpenRouter fallback pool ───────────────────────────────────────────────────
 OR_FALLBACK_MODELS = [
     "nvidia/nemotron-3-super-120b-a12b:free",
     "meta-llama/llama-3.3-70b-instruct:free",
@@ -100,17 +98,15 @@ OR_FALLBACK_MODELS = [
 ]
 
 # ── Rate limit config ──────────────────────────────────────────────────────────
-MIN_SECONDS_BETWEEN_CALLS = 3.0   # global throttle — well under all RPM limits
+MIN_SECONDS_BETWEEN_CALLS = 4.0   # 15 req/min — under all RPM limits
 RETRY_BACKOFF             = [5, 10, 20]
-MAX_RETRIES               = 10    # enough to try all pool models + fallback
+MAX_RETRIES               = 10
 
 # ── State ──────────────────────────────────────────────────────────────────────
-_last_call_time:    float = 0.0
-_active_model_idx:  dict  = {}   # role -> int (pool index)
-_null_count:        dict  = {}   # role -> int (consecutive null responses)
+_last_call_time:   float = 0.0
+_active_model_idx: dict  = {}
+_null_count:       dict  = {}
 
-
-# ── Key loaders ────────────────────────────────────────────────────────────────
 
 def _groq_key() -> str:
     key = os.environ.get("GROQ_API_KEY", "").strip()
@@ -118,30 +114,20 @@ def _groq_key() -> str:
         raise EnvironmentError("❌ GROQ_API_KEY not set in .env")
     return key
 
-def _google_key() -> str:
-    key = os.environ.get("GOOGLE_API_KEY", "").strip()
-    if not key:
-        raise EnvironmentError("❌ GOOGLE_API_KEY not set in .env")
-    return key
-
 def _openrouter_key() -> str:
-    """Return first available OpenRouter key — used only as fallback."""
+    """Return first available OpenRouter key."""
     for i in range(1, 4):
         k = os.environ.get(f"OPENROUTER_API_KEY_{i}", "").strip()
         if k and not k.startswith("sk-or-v1-replace"):
             return k
     raise EnvironmentError("❌ No OpenRouter fallback key found")
 
-
-# ── Model pool management ──────────────────────────────────────────────────────
-
-def _get_active_model(role: str) -> tuple[str, int]:
+def _get_active_model(role: str) -> tuple:
     pool = ROLE_CONFIG[role]["models"]
     idx  = min(_active_model_idx.get(role, 0), len(pool) - 1)
     return pool[idx], idx
 
 def _advance_model(role: str) -> bool:
-    """Move to next model in pool. Returns False if pool exhausted."""
     pool    = ROLE_CONFIG[role]["models"]
     current = _active_model_idx.get(role, 0)
     if current + 1 < len(pool):
@@ -149,15 +135,17 @@ def _advance_model(role: str) -> bool:
         print(f"  ➡️  [{role}] pool[{current+1}/{len(pool)-1}]: {pool[current+1]}")
         _null_count[role] = 0
         return True
-    print(f"  ⚠️  [{role}] all pool models tried — falling back to OpenRouter")
+    print(f"  ⚠️  [{role}] all Groq models tried — switching to OpenRouter fallback")
     return False
 
-def _reset_model(role: str):
-    _active_model_idx[role] = 0
-    _null_count[role]       = 0
-
-
-# ── HTTP helpers ───────────────────────────────────────────────────────────────
+def _is_permanent_error(status: int, body: str) -> bool:
+    if status in (401, 402, 403, 404):
+        return True
+    if status in (502, 504):
+        return True
+    if status == 400 and "model" in body.lower():
+        return True
+    return False
 
 def _enforce_rate_limit():
     global _last_call_time
@@ -167,93 +155,27 @@ def _enforce_rate_limit():
         time.sleep(gap)
     _last_call_time = time.time()
 
-def _is_permanent_error(status: int, body: str) -> bool:
-    """True = model unavailable/moved to paid — switch model, don't retry."""
-    if status in (401, 402, 403, 404):
-        return True
-    if status in (502, 504):
-        return True
-    if status == 400 and "model" in body.lower():
-        return True
-    return False
-
-def _build_headers(provider: str, key: str) -> dict:
-    if provider == "groq":
-        return {
-            "Authorization": f"Bearer {key}",
-            "Content-Type":  "application/json",
-        }
-    if provider == "google":
-        return {
-            "Authorization": f"Bearer {key}",
-            "Content-Type":  "application/json",
-        }
-    # openrouter
-    return {
-        "Authorization": f"Bearer {key}",
-        "Content-Type":  "application/json",
-        "HTTP-Referer":  "https://github.com/rusiru-erandaka/Autonomous_Agentic_Data_Factory",
-        "X-Title":       "Agent Behavior Dataset Pipeline",
-    }
-
-def _get_url(provider: str) -> str:
-    return {"groq": GROQ_URL, "google": GOOGLE_URL, "openrouter": OR_URL}[provider]
-
-def _extract_content(data: dict) -> Optional[str]:
-    """Safely extract text content from any OpenAI-compatible response."""
-    choices = data.get("choices") or []
-    if not choices:
-        return None
-    message = choices[0].get("message") or {}
-    content = message.get("content")
-    if content is None or str(content).strip() == "":
-        return None
-    return str(content).strip()
-
-
-# ── Core call function ─────────────────────────────────────────────────────────
-
-def _call_provider(
-    provider:    str,
-    model:       str,
-    key:         str,
-    messages:    list,
-    temperature: float,
-    max_tokens:  int,
-) -> tuple[Optional[str], int, str]:
-    """
-    Make one HTTP request to a provider.
-    Returns (content_or_None, status_code, raw_body_preview).
-    """
+def _post(url: str, headers: dict, payload: dict) -> tuple:
+    """Make one HTTP request. Returns (content_or_None, status_code, body_preview)."""
     _enforce_rate_limit()
-
-    url     = _get_url(provider)
-    headers = _build_headers(provider, key)
-    payload = {
-        "model":       model,
-        "messages":    messages,
-        "temperature": temperature,
-        "max_tokens":  max_tokens,
-    }
-
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=90)
         body = resp.text[:300]
-
         if resp.status_code == 200:
             data    = resp.json()
-            content = _extract_content(data)
-            return content, 200, body
-
+            choices = data.get("choices") or []
+            if not choices:
+                return None, 200, body
+            msg     = choices[0].get("message") or {}
+            content = msg.get("content")
+            if not content or str(content).strip() == "":
+                return None, 200, f"null_content|finish={choices[0].get('finish_reason','?')}"
+            return str(content).strip(), 200, ""
         return None, resp.status_code, body
-
     except requests.exceptions.Timeout:
         return None, 408, "timeout"
     except Exception as e:
         return None, 0, str(e)[:200]
-
-
-# ── Public API ─────────────────────────────────────────────────────────────────
 
 def call_llm(
     role:        str,
@@ -264,21 +186,17 @@ def call_llm(
     retries:     int   = MAX_RETRIES,
 ) -> Optional[str]:
     """
-    Call LLM for the given role with automatic provider + model pool fallback.
+    Call LLM with Groq primary + OpenRouter fallback.
 
-    Flow:
-      1. Try primary provider (Groq or Google) using active pool model
-      2. On permanent error → advance to next pool model
-      3. On null content ×2 → advance to next pool model
-      4. On 429 → wait for per-minute reset
-      5. If entire primary pool exhausted → try OpenRouter fallback
-      6. Return None only if everything fails
+    Error handling:
+      429            → wait for per-minute reset, retry SAME model
+      401/402/502    → permanent error, advance to next pool model
+      null content×2 → model unsuitable, advance to next pool model
+      timeout        → retry same model with backoff
+      Groq pool exhausted → try OpenRouter fallback models
     """
     if role not in ROLE_CONFIG:
         raise ValueError(f"Unknown role '{role}'. Valid: {list(ROLE_CONFIG.keys())}")
-
-    cfg      = ROLE_CONFIG[role]
-    provider = cfg["provider"]
 
     if json_mode:
         messages = messages.copy()
@@ -287,87 +205,88 @@ def call_llm(
             "No markdown fences, no preamble, no explanation."
         )
 
-    used_fallback = False
+    groq_key     = _groq_key()
+    pool_size    = len(ROLE_CONFIG[role]["models"])
+    using_fallback = False
 
     for attempt in range(retries):
-        # ── Choose model + key ─────────────────────────────────────────────────
-        pool_exhausted = _active_model_idx.get(role, 0) >= len(cfg["models"])
+        # Determine which provider/model to use
+        pool_exhausted = _active_model_idx.get(role, 0) >= pool_size
 
-        if pool_exhausted and not used_fallback:
-            # Primary pool exhausted — try OpenRouter fallback
-            used_fallback     = True
-            current_provider  = "openrouter"
-            or_idx            = attempt % len(OR_FALLBACK_MODELS)
-            current_model     = OR_FALLBACK_MODELS[or_idx]
+        if pool_exhausted:
+            # Use OpenRouter fallback
+            using_fallback = True
+            or_idx    = (attempt - pool_size) % len(OR_FALLBACK_MODELS)
+            model     = OR_FALLBACK_MODELS[or_idx]
             try:
-                current_key = _openrouter_key()
+                key = _openrouter_key()
             except EnvironmentError:
-                print("  ❌ No OpenRouter fallback available either.")
+                print(f"  ❌ No fallback available for '{role}'")
                 return None
-        elif pool_exhausted and used_fallback:
-            print(f"  ❌ All providers exhausted for role '{role}'.")
-            return None
+            url     = OR_URL
+            headers = {
+                "Authorization": f"Bearer {key}",
+                "Content-Type":  "application/json",
+                "HTTP-Referer":  "https://github.com/rusiru-erandaka/Autonomous_Agentic_Data_Factory",
+                "X-Title":       "Agent Behavior Dataset Pipeline",
+            }
         else:
-            current_provider = provider
-            current_model, pool_idx = _get_active_model(role)
-            try:
-                if provider == "groq":
-                    current_key = _groq_key()
-                elif provider == "google":
-                    current_key = _google_key()
-                else:
-                    current_key = _openrouter_key()
-            except EnvironmentError as e:
-                print(f"  ❌ {e}")
-                return None
+            # Use Groq primary
+            using_fallback = False
+            model, pool_idx = _get_active_model(role)
+            key     = groq_key
+            url     = GROQ_URL
+            headers = {
+                "Authorization": f"Bearer {key}",
+                "Content-Type":  "application/json",
+            }
 
-        # ── Make the call ──────────────────────────────────────────────────────
-        content, status, body_preview = _call_provider(
-            current_provider, current_model, current_key,
-            messages, temperature, max_tokens,
-        )
+        payload = {
+            "model":       model,
+            "messages":    messages,
+            "temperature": temperature,
+            "max_tokens":  max_tokens,
+        }
 
-        short_model = current_model.split("/")[-1][:30]
+        content, status, body = _post(url, headers, payload)
+        short_model = model.split("/")[-1][:28]
+        provider    = "fallback" if using_fallback else "groq"
 
         # ── Handle response ────────────────────────────────────────────────────
         if status == 200 and content:
             _null_count[role] = 0
-            src = "fallback" if used_fallback else current_provider
             pidx = _active_model_idx.get(role, 0)
-            print(f"  ✓  [{role}] {src} → {short_model}")
+            print(f"  ✓  [{role}] {provider} pool[{pidx}/{pool_size-1}] → {short_model}")
             return content
 
         if status == 429:
-            wait = 65 if current_provider in ("groq", "google") else 70
+            wait = 65
             print(f"  ⚠️  429 [{role}] {short_model} — waiting {wait}s...")
             time.sleep(wait)
-            continue
+            continue   # retry SAME model
 
-        if _is_permanent_error(status, body_preview):
-            print(f"  ⚠️  {status} [{role}] '{short_model}' — permanent error, advancing pool")
-            if not used_fallback:
-                pool_ok = _advance_model(role)
-                if not pool_ok:
-                    # Will switch to fallback on next iteration
-                    _active_model_idx[role] = len(cfg["models"])
+        if _is_permanent_error(status, body):
+            print(f"  ⚠️  {status} [{role}] '{short_model}' — permanent error")
+            if not using_fallback:
+                ok = _advance_model(role)
+                if not ok:
+                    _active_model_idx[role] = pool_size  # trigger fallback
             continue
 
         if status == 503:
             wait = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
-            print(f"  ⚠️  503 [{role}] — retrying in {wait}s...")
+            print(f"  ⚠️  503 — retrying in {wait}s...")
             time.sleep(wait)
             continue
 
         if status == 200 and content is None:
-            # Null content
             _null_count[role] = _null_count.get(role, 0) + 1
-            print(f"  ⚠️  Null content [{role}] '{short_model}' "
-                  f"(count={_null_count[role]})")
+            print(f"  ⚠️  Null [{role}] '{short_model}' (count={_null_count[role]}) {body}")
             if _null_count.get(role, 0) >= 2:
-                if not used_fallback:
-                    pool_ok = _advance_model(role)
-                    if not pool_ok:
-                        _active_model_idx[role] = len(cfg["models"])
+                if not using_fallback:
+                    ok = _advance_model(role)
+                    if not ok:
+                        _active_model_idx[role] = pool_size
                 _null_count[role] = 0
             else:
                 time.sleep(RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)])
@@ -375,21 +294,20 @@ def call_llm(
 
         if status == 408:
             wait = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
-            print(f"  ⚠️  Timeout [{role}] — retrying in {wait}s...")
+            print(f"  ⚠️  Timeout — retrying in {wait}s...")
             time.sleep(wait)
             continue
 
-        # Unknown error
         wait = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
-        print(f"  ❌ [{role}] status={status}: {body_preview[:100]} — retrying in {wait}s...")
+        print(f"  ❌ [{role}] status={status}: {body[:80]} — retrying in {wait}s...")
         time.sleep(wait)
 
-    print(f"  ❌ All {retries} attempts failed for role '{role}'.")
+    print(f"  ❌ All {retries} attempts failed for '{role}'.")
     return None
 
 
 def call_llm_json(role: str, messages: list, **kwargs) -> Optional[dict]:
-    """call_llm with json_mode=True and auto-parsing + truncation repair."""
+    """call_llm with json_mode=True and auto-parsing + repair."""
     raw = call_llm(role, messages, json_mode=True, **kwargs)
     if raw is None:
         return None
@@ -404,13 +322,12 @@ def call_llm_json(role: str, messages: list, **kwargs) -> Optional[dict]:
     except json.JSONDecodeError:
         salvaged = _repair_truncated_json(raw)
         if salvaged:
-            print(f"  ⚠️  JSON truncated — salvaged {len(salvaged)} item(s).")
+            print(f"  ⚠️  JSON truncated — salvaged {len(salvaged)} items.")
             return salvaged
         return None
 
 
 def _repair_truncated_json(raw: str) -> Optional[list]:
-    """Extract complete JSON objects from a truncated array response."""
     raw = raw.strip()
     if not raw.startswith("["):
         return None
@@ -432,13 +349,11 @@ def _repair_truncated_json(raw: str) -> Optional[list]:
 
 
 def get_active_models_summary() -> dict:
-    """Return current active model per role — used for startup logging."""
-    summary = {}
-    for role, cfg in ROLE_CONFIG.items():
-        idx   = min(_active_model_idx.get(role, 0), len(cfg["models"]) - 1)
-        summary[role] = {
+    return {
+        role: {
             "provider": cfg["provider"],
-            "model":    cfg["models"][idx],
+            "model":    cfg["models"][min(_active_model_idx.get(role, 0), len(cfg["models"]) - 1)],
             "pool":     cfg["models"],
         }
-    return summary
+        for role, cfg in ROLE_CONFIG.items()
+    }
