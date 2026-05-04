@@ -51,17 +51,30 @@ def validate_labels(record: dict) -> tuple[bool, str]:
     if rc is None:
         return False, "reward_computed is None"
 
+    # Catch labeling failure verdict_reason strings — these rows should have been excluded
+    verdict_reason = str(scores.get("verdict_reason", ""))
+    if "primary_call_failed" in verdict_reason or "labeling_unavailable" in verdict_reason:
+        return False, "Row has failed-labeling verdict_reason — exclude from dataset"
+
     rs = scores.get("reward_signal", 0)
     if isinstance(rs, (int, float)) and rs < MIN_REWARD_SIGNAL:
         return False, f"reward_signal too low: {rs}"
 
-    # Catch identical default scores across all records (labeler silently failing)
+    # Catch identical default scores (labeler silently failing)
     tc  = scores.get("task_completion", -1)
     tue = scores.get("tool_use_efficiency", -1)
     rc2 = scores.get("reasoning_coherence", -1)
     oq  = scores.get("overall_quality", -1)
-    if tc == 1 and tue == 1 and rc2 == 1 and oq == 3.0:
-        return False, "All scores are default fallback values — labeler likely failed"
+    if tc == 1 and tue == 1 and rc2 == 1 and round(float(oq), 2) == 3.33:
+        return False, "Identical fallback scores — labeler likely failed silently"
+
+    # Validate: failed outcome must not have task_completion > 0
+    outcome = record.get("outcome", {}).get("status", "")
+    if outcome == "failed" and tc > 0:
+        scores["task_completion"]     = 0
+        scores["reward_signal"]       = 0.0
+        scores["reward_computed"]     = 0.0
+        record["labels"]["trace_level_scores"] = scores
 
     return True, "ok"
 

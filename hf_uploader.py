@@ -65,7 +65,7 @@ def flatten_record(record: dict) -> dict:
     return {
         # ── Identity ──────────────────────────────────────────────────────────
         "trace_id":                    record.get("trace_id", ""),
-        "created_at":                  record.get("created_at", ""),
+        "created_at":                  record.get("created_at", "") or datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"),
         "schema_version":              meta.get("schema_version", "v3.0"),
 
         # ── Task ──────────────────────────────────────────────────────────────
@@ -76,7 +76,10 @@ def flatten_record(record: dict) -> dict:
         "likely_failure_points":       json.dumps(record["task"].get("likely_failure_points", [])),
         "generation_strategy":         record["task"].get("generation_strategy", ""),
         "freshness_source":            record["task"].get("freshness_source", ""),
-        "source_url":                  record["task"].get("source_url", ""),
+        "source_url":                  (
+            record["task"].get("source_url") or
+            f"template:{record['task'].get('freshness_source','unknown')}" if record["task"].get("generation_strategy") in ("template_based","mutation_based") else ""
+        ),
 
         # ── Trace ─────────────────────────────────────────────────────────────
         "trace_json":                  json.dumps(record.get("trace", [])),
@@ -95,7 +98,7 @@ def flatten_record(record: dict) -> dict:
         "labeler_model":               record["labels"]["labeler_model"],
         "labeler_model_2":             record["labels"].get("labeler_model_2", ""),
         "constitution_version":        record["labels"]["constitution_version"],
-        "labeled_at":                  record["labels"]["labeled_at"],
+        "labeled_at":                  record["labels"].get("labeled_at", "") or "",  # ISO-8601 format
         "step_level_scores":           json.dumps(record["labels"].get("step_level_scores", [])),
         "primary_trace_scores":        json.dumps(record["labels"].get("primary_trace_scores", {})),
         "secondary_trace_scores":      json.dumps(record["labels"].get("secondary_trace_scores", {})),
@@ -117,7 +120,7 @@ def flatten_record(record: dict) -> dict:
 
         # ── Metadata ──────────────────────────────────────────────────────────
         "agent_framework":             meta.get("agent_framework", "react"),
-        "agent_model":                 meta.get("agent_model", "groq/openai/gpt-oss-120b"),
+        "agent_model":                 meta.get("agent_model", "groq/llama-3.3-70b-versatile"),
         "agent_temperature":           float(meta.get("agent_temperature", 0.4)),
         "prompt_template_version":     meta.get("prompt_template_version", "v3.0"),
         "token_count_input":           int(meta.get("token_count_input", 0)),
