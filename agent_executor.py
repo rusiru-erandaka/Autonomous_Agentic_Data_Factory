@@ -14,9 +14,12 @@ import time
 import random
 from datetime import datetime
 from typing import Optional
-from openrouter_client import call_llm
+from llm_client import call_llm
 
-PROMPT_TEMPLATE_VERSION = "v2.0"
+PROMPT_TEMPLATE_VERSION = "v3.0"
+
+# Temperature pool — varied per task for dataset diversity
+AGENT_TEMPERATURES = [0.0, 0.2, 0.4, 0.4, 0.6, 0.7]
 
 # ── Agent model pool for diversity ────────────────────────────────────────────
 AGENT_MODELS = [

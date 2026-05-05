@@ -13,7 +13,7 @@ import time
 from datetime import datetime
 from typing import Optional
 
-from openrouter_client import call_llm_json
+from llm_client import call_llm_json
 from task_sources import collect_all_signals, mark_signal_used
 #from tool_registry import TOOL_NAMES, TOOL_LIST_FOR_PROMPT
 
@@ -164,7 +164,7 @@ def convert_signals_llm(signals: list[dict]) -> list[dict]:
     Convert a batch of real-world signals into clean agent tasks using LLM.
     Batches BATCH_SIZE signals per call to respect rate limits.
     """
-    from openrouter_client import call_llm_json
+    from llm_client import call_llm_json
 
     numbered = ""
     for i, s in enumerate(signals):
@@ -477,7 +477,7 @@ def passes_rule_based_check(task: dict) -> bool:
 
 def mutate_tasks_llm(seed_tasks: list[dict]) -> list[dict]:
     """Mutate a batch of tasks using LLM to create harder, more diverse variants."""
-    from openrouter_client import call_llm_json
+    from llm_client import call_llm_json
 
     mutations = [
         "Add a mid-task failure that requires recovery (e.g. 429 rate limit, auth error).",
