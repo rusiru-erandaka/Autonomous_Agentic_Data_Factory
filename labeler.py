@@ -244,7 +244,7 @@ def label_traces(traces: list[dict]) -> list[dict]:
     excluded_count   = 0
     total            = len(traces)
 
-    print(f"\n🏷️  Labeling {total} traces (primary=Groq LLaMA 70B, secondary=Groq Qwen3-32B)...")
+    print(f"\n🏷️  Labeling {total} traces (primary=LLaMA-70B, secondary=LLaMA-8B instant)...")
     print("  ⏳ Waiting 75s for rate limit windows to reset...")
     time.sleep(75)
 
@@ -274,11 +274,13 @@ def label_traces(traces: list[dict]) -> list[dict]:
 
         primary_model_name = _get_active_model_name("labeler")
 
-        # 6s gap between primary and secondary
-        time.sleep(6)
+        # Longer gap between primary and secondary — lets per-minute window recover
+        time.sleep(15)
 
-        # ── Secondary labeler (Groq Qwen → GROQ_API_KEY) ──────────────────────
-        secondary_result = _call_with_retry("secondary", prompt, retries=LABELING_MAX_RETRIES)
+        # ── Secondary labeler (Groq LLaMA 8B → GROQ_API_KEY) ──────────────────
+        # Uses llama-3.1-8b-instant (14.4K RPD) — no daily limit issues
+        # Only 1 retry — 429s are already handled inside call_llm with 65s wait
+        secondary_result = _call_with_retry("secondary", prompt, retries=1)
         dual_labeled     = secondary_result is not None
 
         s_steps  = []
@@ -332,7 +334,7 @@ def label_traces(traces: list[dict]) -> list[dict]:
 
         trace["labels"] = {
             "labeler_model":           primary_model_name,
-            "labeler_model_2":         secondary_model_name,
+            "labeler_model_2":         secondary_model_name if dual_labeled else "",
             "constitution_version":    CONSTITUTION_VERSION,
             "labeled_at":              datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"),
             "step_level_scores":       merged_steps,

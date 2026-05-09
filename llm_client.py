@@ -74,11 +74,11 @@ ROLE_CONFIG = {
     "secondary": {
         "provider": "groq",
         "models": [
-            "qwen/qwen3-32b",
-            "llama-3.3-70b-versatile",
-            "meta-llama/llama-4-scout-17b-16e-instruct",
+            "llama-3.1-8b-instant",            # 14.4K RPD — never hits daily limit
+            "meta-llama/llama-4-scout-17b-16e-instruct",  # 1K RPD fallback
+            "qwen/qwen3-32b",                  # 1K RPD — last resort only
         ],
-        "rpm": 60,
+        "rpm": 30,
     },
     "quality_gate": {
         "provider": "groq",
