@@ -521,6 +521,15 @@ def generate_tasks(total: int = 100) -> list[dict]:
 
     print("\n🔀 Strategy 3: Mutation-based generation...")
     seed_tasks = [seed for seed in get_registry_sample(n=DAILY_BUDGET["mutation_based"] + 6) if seed.get("execution_target") == "real_repo_issue"]
+    if len(seed_tasks) < DAILY_BUDGET["mutation_based"]:
+        current_real_repo_tasks = [
+            task for task in approved
+            if task.get("execution_target") == "real_repo_issue"
+        ]
+        for task in current_real_repo_tasks:
+            if len(seed_tasks) >= DAILY_BUDGET["mutation_based"] + 2:
+                break
+            seed_tasks.append(task)
     mutation_count = 0
     for seed in seed_tasks:
         if mutation_count >= DAILY_BUDGET["mutation_based"]:

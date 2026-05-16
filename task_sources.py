@@ -17,11 +17,15 @@ from datetime import datetime, timezone
 import feedparser
 import requests
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_ONLY_SIGNALS = os.environ.get("GITHUB_ONLY_SIGNALS", "true").lower() == "true"
 MIN_GITHUB_ISSUE_SCORE = int(os.environ.get("MIN_GITHUB_ISSUE_SCORE", "5"))
 MAX_BODY_CHARS = 1800
+GITHUB_TIMEOUT_SECONDS = int(os.environ.get("GITHUB_TIMEOUT_SECONDS", "25"))
+GITHUB_MAX_RETRIES = int(os.environ.get("GITHUB_MAX_RETRIES", "2"))
 
 _SEEN_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "registry", "seen_signals.db")
 
@@ -39,6 +43,24 @@ ANTI_PATTERNS = [
 ]
 
 PATH_HINT_RE = re.compile(r"(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+(?:\.[A-Za-z0-9_.-]+)?")
+
+
+def _github_session() -> requests.Session:
+    session = requests.Session()
+    retry = Retry(
+        total=GITHUB_MAX_RETRIES,
+        connect=GITHUB_MAX_RETRIES,
+        read=GITHUB_MAX_RETRIES,
+        status=GITHUB_MAX_RETRIES,
+        backoff_factor=1.0,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET"}),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=8, pool_maxsize=8)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
 
 
 def _init_seen_db():
@@ -145,23 +167,6 @@ def _score_github_issue(title: str, body: str, labels: list[str], comments: int)
     return score, reasons
 
 
-def _fetch_repo_metadata(repo: str, headers: dict) -> dict:
-    try:
-        resp = requests.get(f"https://api.github.com/repos/{repo}", headers=headers, timeout=15)
-        if resp.status_code != 200:
-            return {}
-        data = resp.json()
-        return {
-            "repo_url": data.get("html_url", f"https://github.com/{repo}"),
-            "repo_clone_url": data.get("clone_url", f"https://github.com/{repo}.git"),
-            "repo_default_branch": data.get("default_branch", "main"),
-            "repo_language": data.get("language", ""),
-            "repo_stars": int(data.get("stargazers_count", 0) or 0),
-        }
-    except Exception:
-        return {}
-
-
 def _build_issue_signal(repo: str, issue: dict, repo_meta: dict) -> dict | None:
     title = _normalize_text(issue.get("title", ""))
     body = _normalize_text((issue.get("body") or "")[:MAX_BODY_CHARS])
@@ -196,7 +201,7 @@ def _build_issue_signal(repo: str, issue: dict, repo_meta: dict) -> dict | None:
         "repo_full_name": repo,
         "repo_url": repo_meta.get("repo_url", f"https://github.com/{repo}"),
         "repo_clone_url": repo_meta.get("repo_clone_url", f"https://github.com/{repo}.git"),
-        "repo_default_branch": repo_meta.get("repo_default_branch", "main"),
+        "repo_default_branch": repo_meta.get("repo_default_branch", ""),
         "repo_language": repo_meta.get("repo_language", ""),
         "repo_stars": int(repo_meta.get("repo_stars", 0) or 0),
         "path_hints": _extract_path_hints(body),
@@ -220,6 +225,7 @@ GITHUB_REPOS = [
 def fetch_github_issues(max_per_repo: int = 8) -> list[dict]:
     _init_seen_db()
     results = []
+    session = _github_session()
     headers = {
         "Accept": "application/vnd.github+json",
         "User-Agent": "agent-behavior-dataset-pipeline",
@@ -229,7 +235,13 @@ def fetch_github_issues(max_per_repo: int = 8) -> list[dict]:
 
     for repo, preferred_labels in GITHUB_REPOS:
         fetched = []
-        repo_meta = _fetch_repo_metadata(repo, headers)
+        repo_meta = {
+            "repo_url": f"https://github.com/{repo}",
+            "repo_clone_url": f"https://github.com/{repo}.git",
+            "repo_default_branch": "",
+            "repo_language": "",
+            "repo_stars": 0,
+        }
         label_attempts = [",".join(preferred_labels), ""]
 
         for label_str in label_attempts:
@@ -245,11 +257,11 @@ def fetch_github_issues(max_per_repo: int = 8) -> list[dict]:
                 if label_str:
                     params["labels"] = label_str
 
-                resp = requests.get(
+                resp = session.get(
                     f"https://api.github.com/repos/{repo}/issues",
                     headers=headers,
                     params=params,
-                    timeout=15,
+                    timeout=GITHUB_TIMEOUT_SECONDS,
                 )
                 if resp.status_code != 200:
                     continue
