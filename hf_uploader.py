@@ -19,6 +19,34 @@ def _get_dataset_repo() -> str:
     return os.environ.get("HF_DATASET_REPO", "").strip()
 
 
+def _normalize_date(value: str) -> str:
+    value = (value or "").strip()
+    if not value:
+        return value
+    if len(value) == 10 and value[4] == "-" and value[7] == "-":
+        return value
+    for fmt in ("%m/%d/%Y", "%Y/%m/%d", "%m-%d-%Y"):
+        try:
+            return datetime.strptime(value, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return value
+
+
+def _fallback_source_url(task: dict) -> str:
+    existing = task.get("source_url", "")
+    if existing:
+        return existing
+    freshness = task.get("freshness_source", "")
+    if freshness.startswith("github:") and "#" in freshness:
+        repo, issue_no = freshness[len("github:"):].split("#", 1)
+        if repo and issue_no.isdigit():
+            return f"https://github.com/{repo}/issues/{issue_no}"
+    if task.get("generation_strategy") in ("template_based", "mutation_based"):
+        return f"template:{task.get('freshness_source', 'unknown')}"
+    return ""
+
+
 def flatten_record(record: dict) -> dict:
     """Flatten nested record into a single HuggingFace-ready row."""
     trace_scores = record["labels"]["trace_level_scores"]
@@ -59,10 +87,7 @@ def flatten_record(record: dict) -> dict:
         "likely_failure_points": json.dumps(record["task"].get("likely_failure_points", [])),
         "generation_strategy": record["task"].get("generation_strategy", ""),
         "freshness_source": record["task"].get("freshness_source", ""),
-        "source_url": (
-            record["task"].get("source_url") or
-            (f"template:{record['task'].get('freshness_source', 'unknown')}" if record["task"].get("generation_strategy") in ("template_based", "mutation_based") else "")
-        ),
+        "source_url": _fallback_source_url(record["task"]),
         "repo_url": record["task"].get("repo_url", ""),
         "repo_clone_url": record["task"].get("repo_clone_url", ""),
         "repo_full_name": record["task"].get("repo_full_name", ""),
@@ -100,6 +125,7 @@ def flatten_record(record: dict) -> dict:
         "dual_labeled": bool(record["labels"].get("dual_labeled", False)),
         "agreement_score": float(agreement) if isinstance(agreement, (int, float)) else None,
         "conflict_flag": bool(record["labels"].get("conflict_flag", False)),
+        "conflict_dimensions": json.dumps(record["labels"].get("conflict_dimensions", [])),
         "merge_strategy": record["labels"].get("merge_strategy", ""),
         "reward_adjustment_reason": record["labels"].get("reward_adjustment_reason", ""),
         "quality_formula": record["labels"].get("quality_formula", "((task_completion + tool_use_efficiency + reasoning_coherence + safety_compliance) / 12) * 10"),
@@ -122,7 +148,7 @@ def flatten_record(record: dict) -> dict:
         "prompt_template_version": meta.get("prompt_template_version", "v4.0"),
         "token_count_input": int(meta.get("token_count_input", 0)),
         "token_count_output": int(meta.get("token_count_output", 0)),
-        "world_context_date": meta.get("world_context_date", ""),
+        "world_context_date": _normalize_date(meta.get("world_context_date", "")),
     }
 
 
