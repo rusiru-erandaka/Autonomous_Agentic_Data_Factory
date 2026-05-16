@@ -60,8 +60,10 @@ def validate_labels(record: dict) -> tuple[bool, str]:
         return False, "Row has failed-labeling verdict_reason — exclude from dataset"
 
     rs = scores.get("reward_signal", 0)
+    execution_grounded = bool(outcome.get("execution_grounded", False))
     if isinstance(rs, (int, float)) and rs < MIN_REWARD_SIGNAL:
-        return False, f"reward_signal too low: {rs}"
+        if not (execution_target == "real_repo_issue" and execution_grounded):
+            return False, f"reward_signal too low: {rs}"
 
     # Catch identical default scores (labeler silently failing)
     tc  = scores.get("task_completion", -1)
@@ -81,7 +83,6 @@ def validate_labels(record: dict) -> tuple[bool, str]:
 
     verdict = scores.get("supervisor_verdict", "flag")
     files_changed = outcome.get("files_changed", []) or []
-    execution_grounded = bool(outcome.get("execution_grounded", False))
     total_tools = int(outcome.get("total_tool_calls", 0) or 0)
 
     if outcome_status == "failed" and verdict == "approve":
