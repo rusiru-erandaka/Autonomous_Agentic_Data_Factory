@@ -395,7 +395,15 @@ def _make_tool_registry(task: str):
     return {
         "web_search": web_search,
         "file_search": lambda i: {"matches": [{"file": "src/agent.py", "line": 42, "content": f"Found {i.get('query', '')}"}]},
-        "file_edit": lambda i: {"status": "success", "file": i.get("file", "unknown.py")},
+        "file_edit": lambda i: {
+            "status": "success",
+            "file": (
+                i.get("file") or
+                i.get("file_path") or
+                i.get("filename") or
+                "unknown.py"
+            ),
+        },
         "file_read": lambda i: {"content": f"# File: {i.get('path', '')}\ndef example():\n    pass\n", "lines": 3},
         "code_search": lambda i: {"matches": [{"file": "src/main.py", "line": 77, "snippet": f"def {i.get('query', 'function')}(self): ..."}], "total": 1},
         "code_view": lambda i: {"content": f"# {i.get('file', '')}\ndef example_function():\n    result = api_call()\n    return result\n", "language": "python"},
