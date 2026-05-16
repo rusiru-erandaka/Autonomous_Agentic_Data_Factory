@@ -31,6 +31,7 @@ PROMPT_TEMPLATE_VERSION = "v4.0"
 EXECUTION_ROOT = Path(__file__).resolve().parent / "registry" / "execution_workspace"
 REAL_AGENT_MAX_STEPS = 6
 MAX_COMMAND_OUTPUT_CHARS = 4000
+KEEP_EXECUTION_WORKSPACES = os.environ.get("KEEP_EXECUTION_WORKSPACES", "false").lower() == "true"
 
 # Temperature pool for synthetic traces only.
 AGENT_TEMPERATURES = [0.0, 0.2, 0.4, 0.4, 0.6, 0.7]
@@ -129,7 +130,7 @@ def _prepare_repo_workspace(task: dict, trace_id: str) -> tuple[Path, list[dict]
     workspace.parent.mkdir(parents=True, exist_ok=True)
 
     repo_url = task.get("repo_clone_url") or task.get("repo_url")
-    default_branch = task.get("repo_default_branch") or "main"
+    default_branch = (task.get("repo_default_branch") or "").strip()
     commands = []
 
     if not repo_url:
@@ -139,13 +140,24 @@ def _prepare_repo_workspace(task: dict, trace_id: str) -> tuple[Path, list[dict]
             "repo_workspace": str(workspace),
         }
 
-    clone_cmd = f"git clone --depth 1 --branch {default_branch} {repo_url} '{workspace.name}'"
-    clone_result = _run_ps(clone_cmd, EXECUTION_ROOT, timeout_s=240)
-    commands.append(clone_result)
-    if not clone_result["ok"]:
+    clone_cmds = []
+    if default_branch:
+        clone_cmds.append(f"git clone --depth 1 --branch {default_branch} {repo_url} '{workspace.name}'")
+    clone_cmds.append(f"git clone --depth 1 {repo_url} '{workspace.name}'")
+
+    clone_result = None
+    for clone_cmd in clone_cmds:
+        clone_result = _run_ps(clone_cmd, EXECUTION_ROOT, timeout_s=240)
+        commands.append(clone_result)
+        if clone_result["ok"]:
+            break
+        if workspace.exists():
+            shutil.rmtree(workspace, ignore_errors=True)
+
+    if not clone_result or not clone_result["ok"]:
         return workspace, commands, {
             "repo_prepared": False,
-            "repo_prepare_error": f"clone_failed:{clone_result['exit_code']}",
+            "repo_prepare_error": f"clone_failed:{clone_result['exit_code'] if clone_result else 1}",
             "repo_workspace": str(workspace),
         }
 
@@ -157,6 +169,17 @@ def _prepare_repo_workspace(task: dict, trace_id: str) -> tuple[Path, list[dict]
         "repo_workspace": str(workspace),
         "repo_commit": (git_rev.get("stdout") or "").strip(),
     }
+
+
+def _cleanup_workspace(workspace: Path) -> bool:
+    if KEEP_EXECUTION_WORKSPACES:
+        return False
+    try:
+        if workspace.exists():
+            shutil.rmtree(workspace, ignore_errors=True)
+        return True
+    except Exception:
+        return False
 
 
 def _real_repo_prompt(task: dict, command_results: list[dict]) -> str:
@@ -206,6 +229,12 @@ def _run_real_repo_task(task: dict) -> dict:
         })
 
     if not prep_meta.get("repo_prepared"):
+        steps.append({
+            "step": len(steps) + 1,
+            "type": "reasoning",
+            "content": f"Repository preparation failed before code inspection: {prep_meta.get('repo_prepare_error', 'repo_prepare_failed')}.",
+        })
+        workspace_deleted = _cleanup_workspace(workspace)
         return {
             "trace_id": trace_id,
             "created_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -235,6 +264,7 @@ def _run_real_repo_task(task: dict) -> dict:
                 "world_context_date": datetime.now().strftime("%Y-%m-%d"),
                 "schema_version": "v4.0",
                 **prep_meta,
+                "workspace_deleted": workspace_deleted,
             },
         }
 
@@ -288,6 +318,12 @@ def _run_real_repo_task(task: dict) -> dict:
 
     diff_name_only = _run_ps("git diff --name-only", workspace, timeout_s=30)
     commands.append(diff_name_only)
+    steps.append({
+        "step": len(steps) + 1,
+        "type": "command",
+        "command": diff_name_only["command"],
+        "result": diff_name_only,
+    })
     changed_files = [
         line.strip() for line in (diff_name_only.get("stdout") or "").splitlines() if line.strip()
     ]
@@ -302,6 +338,8 @@ def _run_real_repo_task(task: dict) -> dict:
         outcome_status = "success"
         failure_reason = None
         final_answer = "Repository inspection and code changes were captured in the workspace."
+
+    workspace_deleted = _cleanup_workspace(workspace)
 
     return {
         "trace_id": trace_id,
@@ -333,6 +371,7 @@ def _run_real_repo_task(task: dict) -> dict:
             "schema_version": "v4.0",
             **prep_meta,
             "candidate_files": candidate_files[:6],
+            "workspace_deleted": workspace_deleted,
         },
     }
 

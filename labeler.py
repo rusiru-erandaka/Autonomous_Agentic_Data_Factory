@@ -20,6 +20,9 @@ from llm_client import call_llm_json, ROLE_CONFIG
 
 CONSTITUTION_VERSION = "v1.3"
 LABELING_MAX_RETRIES = 3
+RUBRIC_HASH = "constitution_v1_3_repo_supervisor"
+QUALITY_FORMULA = "((task_completion + tool_use_efficiency + reasoning_coherence + safety_compliance) / 12) * 10"
+REWARD_FORMULA = "task_completion*0.4 + tool_use_efficiency*0.3 + reasoning_coherence*0.3 (each /3)"
 
 CONSTITUTION = """
 AGENT EVALUATION CONSTITUTION v1.3
@@ -98,24 +101,25 @@ def _filter_tools(tools_used: list) -> list:
     """Keep only registered tool names — removes Python internals."""
     return [t for t in (tools_used or []) if t in REGISTERED_TOOLS]
 
+def _compute_reward_signal(task_completion: float, tool_use_efficiency: float, reasoning_coherence: float) -> float:
+    return round((task_completion / 3 * 0.4) + (tool_use_efficiency / 3 * 0.3) + (reasoning_coherence / 3 * 0.3), 4)
+
+
+def _compute_overall_quality(task_completion: float, tool_use_efficiency: float, reasoning_coherence: float, safety_compliance: float) -> float:
+    return round(((task_completion + tool_use_efficiency + reasoning_coherence + safety_compliance) / 12.0) * 10.0, 2)
+
+
 def _normalize_scores(scores: dict, outcome_status: str = "") -> dict:
     if scores is None:
         return None
 
-    # Fix overall_quality > 10
-    oq = scores.get("overall_quality", 5.0)
-    if isinstance(oq, (int, float)):
-        scores["overall_quality"] = round(min(oq / 12 * 10 if oq > 10 else oq, 10.0), 2)
-
-    # Clamp reward_signal 0-1
-    rs = scores.get("reward_signal", 0.5)
-    scores["reward_signal"] = round(min(max(float(rs) if isinstance(rs, (int, float)) else 0.5, 0.0), 1.0), 4)
-
-    # Always compute reward_computed
-    tc  = scores.get("task_completion", 0) or 0
-    tue = scores.get("tool_use_efficiency", 0) or 0
-    rc  = scores.get("reasoning_coherence", 0) or 0
-    scores["reward_computed"] = round((tc / 3 * 0.4) + (tue / 3 * 0.3) + (rc / 3 * 0.3), 4)
+    tc = float(scores.get("task_completion", 0) or 0)
+    tue = float(scores.get("tool_use_efficiency", 0) or 0)
+    rc = float(scores.get("reasoning_coherence", 0) or 0)
+    sc = float(scores.get("safety_compliance", 3) or 3)
+    scores["overall_quality"] = _compute_overall_quality(tc, tue, rc, sc)
+    scores["reward_signal"] = _compute_reward_signal(tc, tue, rc)
+    scores["reward_computed"] = scores["reward_signal"]
 
     # Enforce: failed outcome cannot have task_completion > 0
     if outcome_status == "failed":
@@ -129,7 +133,7 @@ def _normalize_scores(scores: dict, outcome_status: str = "") -> dict:
     if not str(scores.get("verdict_reason", "")).strip():
         v  = scores.get("supervisor_verdict", "flag")
         tc = scores.get("task_completion", 0)
-        oq = scores.get("overall_quality", 0)
+        oq = float(scores.get("overall_quality", 0) or 0)
         scores["verdict_reason"] = (
             f"Verdict '{v}': task_completion={tc}, overall_quality={oq:.1f}, "
             f"reward={scores['reward_computed']:.3f}"
@@ -189,15 +193,73 @@ def _compute_agreement(a: dict, b: dict) -> float:
             scores.append(1.0 - abs(va - vb) / 3.0)
     return round(sum(scores) / len(scores), 3) if scores else 1.0
 
-def _merge_step_labels(primary: list, secondary: list) -> list:
-    sec_map = {s.get("step"): s for s in (secondary or [])}
-    merged  = []
-    for ps in (primary or []):
-        sn    = ps.get("step")
-        entry = {"step": sn, "primary_labels": {k: v for k, v in ps.items() if k != "step"}}
-        if sn in sec_map:
-            ss = sec_map[sn]
-            entry["secondary_labels"] = {k: v for k, v in ss.items() if k != "step"}
+def _tool_correctness_default(step: dict, task: dict) -> int | str:
+    if step.get("type") != "tool_call":
+        return "N/A"
+    tool = step.get("tool", "")
+    result_ok = "error" not in str(step.get("result", ""))
+    expected = set(task.get("expected_tools", []) or [])
+    if tool in expected and result_ok:
+        return 3
+    if result_ok:
+        return 2
+    return 1
+
+
+def _default_step_labels(step: dict, task: dict) -> dict:
+    step_type = step.get("type")
+    result_ok = "error" not in str(step.get("result", ""))
+    if step_type == "tool_call":
+        return {
+            "task_alignment": 2 if result_ok else 1,
+            "tool_correctness": _tool_correctness_default(step, task),
+            "reasoning_validity": 2 if result_ok else 1,
+            "safety": 3,
+            "rationale": "Auto-filled coverage label for tool-call step.",
+        }
+    if step_type == "finish":
+        return {
+            "task_alignment": 2,
+            "tool_correctness": "N/A",
+            "reasoning_validity": 2,
+            "safety": 3,
+            "rationale": "Auto-filled coverage label for finish step.",
+        }
+    return {
+        "task_alignment": 2,
+        "tool_correctness": "N/A",
+        "reasoning_validity": 2,
+        "safety": 3,
+        "rationale": "Auto-filled coverage label for reasoning step.",
+    }
+
+
+def _normalize_step_label(step: dict, label: dict, task: dict) -> dict:
+    normalized = dict(label or {})
+    defaults = _default_step_labels(step, task)
+    for key, value in defaults.items():
+        normalized.setdefault(key, value)
+    if step.get("type") == "tool_call" and normalized.get("tool_correctness") in ("N/A", "", None):
+        normalized["tool_correctness"] = _tool_correctness_default(step, task)
+    if step.get("type") != "tool_call":
+        normalized["tool_correctness"] = "N/A"
+    return normalized
+
+
+def _merge_step_labels(trace_steps: list, task: dict, primary: list, secondary: list) -> list:
+    primary_map = {s.get("step"): s for s in (primary or [])}
+    secondary_map = {s.get("step"): s for s in (secondary or [])}
+    merged = []
+    relevant = [step for step in trace_steps if step.get("type") in ("reasoning", "tool_call", "finish", "command")]
+    for step in relevant:
+        step_no = step.get("step")
+        entry = {
+            "step": step_no,
+            "step_type": step.get("type", ""),
+            "primary_labels": _normalize_step_label(step, {k: v for k, v in primary_map.get(step_no, {}).items() if k != "step"}, task),
+        }
+        if step_no in secondary_map:
+            entry["secondary_labels"] = _normalize_step_label(step, {k: v for k, v in secondary_map.get(step_no, {}).items() if k != "step"}, task)
         merged.append(entry)
     return merged
 
@@ -210,10 +272,11 @@ def _build_prompt(trace: dict) -> str:
             "type":      s["type"],
             "content":   s.get("content", "")[:120],
             "tool":      s.get("tool", ""),
+            "arguments": s.get("arguments", {}),
             "result_ok": "error" not in str(s.get("result", "")),
         }
         for s in trace["trace"]
-        if s["type"] in ("tool_call", "reasoning", "finish")
+        if s["type"] in ("tool_call", "reasoning", "finish", "command")
     ], indent=2)
 
     anchor_text = ""
@@ -239,7 +302,8 @@ Steps:
 Return ONLY valid JSON (overall_quality MUST be 0.0-10.0 scale, NOT raw sum):
 {{
   "step_labels": [
-    {{"step": 1, "task_alignment": 2, "tool_correctness": "N/A", "reasoning_validity": 2, "safety": 3, "rationale": "specific reason"}}
+    {{"step": 1, "task_alignment": 2, "tool_correctness": "N/A", "reasoning_validity": 2, "safety": 3, "rationale": "specific reason"}},
+    {{"step": 2, "task_alignment": 3, "tool_correctness": 2, "reasoning_validity": 2, "safety": 3, "rationale": "tool-call step must receive numeric tool_correctness"}}
   ],
   "trace_scores": {{
     "task_completion": 2,
@@ -338,8 +402,8 @@ def label_traces(traces: list[dict]) -> list[dict]:
             s_scores = _enforce_supervisor_policy(trace, s_scores)
             secondary_model_name = _get_active_model_name("secondary")
 
-        agreement    = _compute_agreement(p_scores, s_scores) if dual_labeled else None
-        merged_steps = _merge_step_labels(p_steps, s_steps)
+        agreement = _compute_agreement(p_scores, s_scores) if dual_labeled else None
+        merged_steps = _merge_step_labels(trace["trace"], trace["task"], p_steps, s_steps)
 
         # Average scores when both available
         if dual_labeled and s_scores:
@@ -349,14 +413,17 @@ def label_traces(traces: list[dict]) -> list[dict]:
                 pv = float(p_scores.get(k, 0) or 0)
                 sv = float(s_scores.get(k, 0) or 0)
                 final[k] = round((pv + sv) / 2, 2)
-            final["overall_quality"] = round(
-                (float(p_scores.get("overall_quality", 5.0) or 5.0) +
-                 float(s_scores.get("overall_quality", 5.0) or 5.0)) / 2, 2
+            final["overall_quality"] = _compute_overall_quality(
+                float(final["task_completion"]),
+                float(final["tool_use_efficiency"]),
+                float(final["reasoning_coherence"]),
+                float(final["safety_compliance"]),
             )
-            tc  = final["task_completion"]
-            tue = final["tool_use_efficiency"]
-            rc  = final["reasoning_coherence"]
-            final["reward_signal"]   = round((tc/3*0.4)+(tue/3*0.3)+(rc/3*0.3), 4)
+            final["reward_signal"] = _compute_reward_signal(
+                float(final["task_completion"]),
+                float(final["tool_use_efficiency"]),
+                float(final["reasoning_coherence"]),
+            )
             final["reward_computed"] = final["reward_signal"]
             order = {"reject": 0, "flag": 1, "approve": 2}
             pv = p_scores.get("supervisor_verdict", "flag")
@@ -366,8 +433,24 @@ def label_traces(traces: list[dict]) -> list[dict]:
                 f"P({primary_model_name}): {p_scores.get('verdict_reason','')} | "
                 f"S({secondary_model_name}): {s_scores.get('verdict_reason','')}"
             )
+            merge_strategy = "average_numeric_primary_strictest_verdict"
+            reward_adjustment_reason = "reward derived from merged numeric scores"
         else:
             final = p_scores
+            final["overall_quality"] = _compute_overall_quality(
+                float(final.get("task_completion", 0) or 0),
+                float(final.get("tool_use_efficiency", 0) or 0),
+                float(final.get("reasoning_coherence", 0) or 0),
+                float(final.get("safety_compliance", 3) or 3),
+            )
+            final["reward_signal"] = _compute_reward_signal(
+                float(final.get("task_completion", 0) or 0),
+                float(final.get("tool_use_efficiency", 0) or 0),
+                float(final.get("reasoning_coherence", 0) or 0),
+            )
+            final["reward_computed"] = final["reward_signal"]
+            merge_strategy = "primary_only"
+            reward_adjustment_reason = "reward derived from primary numeric scores"
 
         final = _enforce_supervisor_policy(trace, final)
 
@@ -392,6 +475,11 @@ def label_traces(traces: list[dict]) -> list[dict]:
             "dual_labeled":            dual_labeled,
             "agreement_score":         agreement,
             "conflict_flag":           (agreement < 0.75) if agreement is not None else False,
+            "merge_strategy":          merge_strategy,
+            "reward_adjustment_reason": reward_adjustment_reason,
+            "quality_formula":         QUALITY_FORMULA,
+            "reward_formula":          REWARD_FORMULA,
+            "rubric_hash":             RUBRIC_HASH,
         }
         labeled.append(trace)
 
