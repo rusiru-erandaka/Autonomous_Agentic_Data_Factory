@@ -1,371 +1,329 @@
 """
 task_generator.py
-Converts raw real-world signals into clean, structured agent tasks.
-Uses 3 strategies: template-based, LLM-generative, mutation-based.
-Runs all tasks through a quality gate before storing in SQLite registry.
+Converts source signals into executable tasks and stores them in a registry.
+
+The pipeline is transitioning from synthetic prompts toward repo-grounded coding
+tasks. Real GitHub issues now carry repo provenance and execution metadata all
+the way into the task registry.
 """
 
-import json
-import sqlite3
 import hashlib
+import json
 import os
-import time
+import random
+import sqlite3
 from datetime import datetime
 from typing import Optional
 
 from llm_client import call_llm_json
 from task_sources import collect_all_signals, mark_signal_used
-#from tool_registry import TOOL_NAMES, TOOL_LIST_FOR_PROMPT
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "registry", "tasks.db")
 
-# ── YAML-style templates stored as Python dicts (no extra file needed) ─────────
+REAL_CODING_TOOL_NAMES = [
+    "file_search", "file_read", "file_edit", "code_search", "code_view",
+    "code_edit", "code_executor", "git", "web_search", "api_fetch",
+]
+
 TASK_TEMPLATES = [
     {
         "id": "api_chain_001",
         "pattern": "Fetch {data_type} from {source_api} and sync it to {target_api} with proper error handling.",
         "slots": {
-            "data_type":   ["overdue invoices", "customer records", "product inventory", "support tickets", "subscription data"],
-            "source_api":  ["Stripe", "Shopify", "Salesforce", "HubSpot", "Twilio"],
-            "target_api":  ["Notion", "Airtable", "Google Sheets", "Slack", "Linear"],
+            "data_type": ["overdue invoices", "customer records", "product inventory", "support tickets", "subscription data"],
+            "source_api": ["Stripe", "Shopify", "Salesforce", "HubSpot", "Twilio"],
+            "target_api": ["Notion", "Airtable", "Google Sheets", "Slack", "Linear"],
         },
         "difficulty": "medium",
-        "expected_tools": ["api_fetch", "api_write"],
+        "expected_tools": ["api_fetch", "file_edit"],
         "likely_failure_points": ["pagination not handled", "rate limit hit", "missing auth token"],
     },
     {
         "id": "code_debug_001",
         "pattern": "Debug why {component} throws {error_type} when {condition} and write a fix.",
         "slots": {
-            "component":  ["the API client", "the webhook handler", "the data parser", "the retry logic"],
+            "component": ["the API client", "the webhook handler", "the data parser", "the retry logic"],
             "error_type": ["a 429 error", "a null pointer exception", "a timeout", "a schema mismatch"],
-            "condition":  ["processing large payloads", "handling concurrent requests", "running in production", "parsing nested JSON"],
+            "condition": ["processing large payloads", "handling concurrent requests", "running in production", "parsing nested JSON"],
         },
         "difficulty": "medium",
-        "expected_tools": ["code_executor", "web_search"],
+        "expected_tools": ["code_search", "code_edit", "code_executor"],
         "likely_failure_points": ["root cause misidentified", "fix introduces new bug"],
-    },
-    {
-        "id": "multi_step_001",
-        "pattern": "Write a Python script that calls {api_a} to get {resource}, transforms the data, then posts results to {api_b}.",
-        "slots": {
-            "api_a":     ["GitHub API", "Stripe API", "OpenAI API", "HuggingFace API"],
-            "resource":  ["open issues", "failed payments", "model usage stats", "dataset metadata"],
-            "api_b":     ["a Slack webhook", "a Notion database", "a Google Sheet", "an Airtable base"],
-        },
-        "difficulty": "complex",
-        "expected_tools": ["code_executor", "api_fetch", "api_write"],
-        "likely_failure_points": ["auth handling", "data shape mismatch", "API response pagination"],
-    },
-    {
-        "id": "agent_orchestration_001",
-        "pattern": "Build an agent that monitors {source} for {event} and automatically triggers {action}.",
-        "slots": {
-            "source": ["a GitHub repo", "a Stripe webhook", "an RSS feed", "a Slack channel"],
-            "event":  ["new pull requests", "failed payments", "new posts", "keyword mentions"],
-            "action": ["creates a Notion task", "sends a Slack alert", "updates a spreadsheet", "opens a Linear issue"],
-        },
-        "difficulty": "complex",
-        "expected_tools": ["webhook_listener", "api_write", "notification"],
-        "likely_failure_points": ["event deduplication", "async handling", "auth scope missing"],
     },
 ]
 
-import random
+SOURCE_TOOL_MAP = {
+    "github": (["file_search", "code_search", "code_edit", "code_executor", "git"], "complex"),
+    "openai": (["file_search", "code_search", "code_edit", "code_executor"], "complex"),
+    "langchain": (["file_search", "code_search", "code_edit", "code_executor"], "complex"),
+    "autogen": (["file_search", "code_search", "code_edit", "code_executor"], "complex"),
+    "crewai": (["file_search", "code_search", "code_edit", "code_executor"], "complex"),
+    "api": (["api_fetch", "file_edit", "code_executor"], "medium"),
+    "code": (["code_search", "code_edit", "code_executor"], "medium"),
+}
+
+FAILURE_MAP = {
+    "github": ["issue not reproducible locally", "failing tests not isolated", "wrong target file edited"],
+    "openai": ["client API change misread", "response schema mismatch", "test fixture update missing"],
+    "langchain": ["integration path misidentified", "snapshot expectations stale", "tool wiring incomplete"],
+    "autogen": ["agent flow regression", "async behavior mismatch", "fixture coverage missing"],
+    "crewai": ["task orchestration regression", "flow contract mismatch", "test setup incomplete"],
+    "api": ["401 unauthorized", "timeout", "malformed response"],
+    "code": ["syntax error", "import not found", "wrong output type"],
+}
+
+TASK_PATTERNS = [
+    "Reproduce and fix the GitHub issue: {title}. Work inside the repository, change the relevant code, and validate the fix with the most relevant tests you can run.",
+    "Investigate the repository issue '{title}', identify the root cause, implement a code fix, and verify the result with targeted execution evidence.",
+    "Patch the codebase to resolve: {title}. Use repository search, inspect the affected files, edit the fix, and run the best available validation command.",
+]
+
+
+def _issue_task_metadata(signal: dict) -> dict:
+    return {
+        "source_url": signal.get("source_url", ""),
+        "repo_url": signal.get("repo_url", ""),
+        "repo_clone_url": signal.get("repo_clone_url", ""),
+        "repo_full_name": signal.get("repo_full_name", ""),
+        "repo_default_branch": signal.get("repo_default_branch", ""),
+        "repo_language": signal.get("repo_language", ""),
+        "issue_number": signal.get("issue_number"),
+        "issue_title": signal.get("title", ""),
+        "issue_labels": signal.get("issue_labels", []),
+        "path_hints": signal.get("path_hints", []),
+        "execution_target": signal.get("execution_target", "synthetic"),
+        "task_type": "repo_issue_fix",
+    }
+
+
+def _merge_task_metadata(task: dict, signal: Optional[dict] = None) -> dict:
+    merged = dict(task or {})
+    if signal:
+        merged.update(_issue_task_metadata(signal))
+    merged.setdefault("source_url", "")
+    merged.setdefault("repo_url", "")
+    merged.setdefault("repo_clone_url", "")
+    merged.setdefault("repo_full_name", "")
+    merged.setdefault("repo_default_branch", "")
+    merged.setdefault("repo_language", "")
+    merged.setdefault("issue_number", None)
+    merged.setdefault("issue_title", merged.get("task", ""))
+    merged.setdefault("issue_labels", [])
+    merged.setdefault("path_hints", [])
+    merged.setdefault("execution_target", "synthetic")
+    merged.setdefault("task_type", "generic_task")
+    return merged
+
 
 def generate_template_tasks(count: int = 40) -> list[dict]:
-    """Fill template slots randomly to generate structured tasks."""
     tasks = []
     for _ in range(count):
         template = random.choice(TASK_TEMPLATES)
         filled = template["pattern"]
         for slot, options in template["slots"].items():
             filled = filled.replace(f"{{{slot}}}", random.choice(options))
-
-        tasks.append({
-            "task":                 filled,
-            "difficulty":          template["difficulty"],
-            "expected_tools":      template["expected_tools"],
+        tasks.append(_merge_task_metadata({
+            "task": filled,
+            "difficulty": template["difficulty"],
+            "expected_tools": template["expected_tools"],
             "likely_failure_points": template["likely_failure_points"],
             "generation_strategy": "template_based",
-            "freshness_source":    "template_library",
-        })
+            "freshness_source": "template_library",
+            "execution_target": "synthetic",
+            "task_type": "synthetic_template",
+        }))
     return tasks
 
 
-BATCH_SIZE = 3   # used by mutation batching only
-
-# ── LLM-based signal → task conversion ───────────────────────────────────────
-# Uses the generator model (gemma) to convert real signals into clean tasks.
-# Batches 3 signals per call to stay within rate limits.
-# Map source keywords to tools and difficulty
-SOURCE_TOOL_MAP = {
-    "stripe":     (["stripe_api", "api_fetch"],         "medium"),
-    "notion":     (["notion_api", "api_write"],          "medium"),
-    "github":     (["github_api", "code_executor"],      "medium"),
-    "slack":      (["slack_api", "api_write"],           "simple"),
-    "shopify":    (["shopify_api", "api_fetch"],         "medium"),
-    "langchain":  (["code_executor", "llm_api"],         "complex"),
-    "crewai":     (["code_executor", "llm_api"],         "complex"),
-    "autogen":    (["code_executor", "llm_api"],         "complex"),
-    "openai":     (["openai_api", "code_executor"],      "medium"),
-    "huggingface":["huggingface_api", "code_executor"],
-    "airtable":   (["airtable_api", "api_write"],        "simple"),
-    "webhook":    (["webhook_listener", "api_write"],    "medium"),
-    "api":        (["api_fetch", "api_write"],           "medium"),
-    "code":       (["code_executor", "web_search"],      "medium"),
-}
-
-FAILURE_MAP = {
-    "stripe":    ["rate limit hit", "missing webhook signature"],
-    "notion":    ["database ID not found", "property type mismatch"],
-    "github":    ["auth token expired", "repo not found"],
-    "langchain": ["agent loop not terminating", "tool not found"],
-    "crewai":    ["task delegation failure", "agent timeout"],
-    "api":       ["401 unauthorized", "timeout", "malformed response"],
-    "code":      ["syntax error", "import not found", "wrong output type"],
-}
-
-TASK_PATTERNS = [
-    "Fetch {resource} from {service} and process the results with error handling.",
-    "Debug and fix the issue described: {title}. Write a working solution.",
-    "Build an agent that automates: {title}. Handle edge cases gracefully.",
-    "Write a script to integrate {service} with another service based on: {title}",
-    "Investigate and resolve: {title}. Document the root cause and fix.",
-]
-
-def convert_signal_to_task(signal: dict) -> Optional[dict]:
-    """
-    Convert a raw real-world signal into a clean agent task using LLM.
-    Single signal per call to keep output tokens low and avoid truncation.
-    """
-    prompt = f"""Convert this real-world developer signal into an AI agent task.
-
-Signal ({signal['source']}):
-{signal['raw_text'][:200]}
-
-Rules: requires 2+ tool calls, fits API Orchestration or Code Agent niche, solvable by AI agent.
-If irrelevant return null.
-
-Return ONLY JSON (or null):
-{{
-  "task": "one sentence executable agent task",
-  "difficulty": "simple|medium|complex",
-  "expected_tools": ["tool1", "tool2"],
-  "likely_failure_points": ["point1"],
-  "generation_strategy": "llm_generative",
-  "freshness_source": "{signal['source']}"
-}}"""
-    return call_llm_json("generator", [{"role": "user", "content": prompt}], max_tokens=300)
-
-
-def convert_signals_llm(signals: list[dict]) -> list[dict]:
-    """
-    Convert a batch of real-world signals into clean agent tasks using LLM.
-    Batches BATCH_SIZE signals per call to respect rate limits.
-    """
-    from llm_client import call_llm_json
-
-    numbered = ""
-    for i, s in enumerate(signals):
-        numbered += f"\n--- Signal {i+1} (source: {s['source']}) ---\n{s['raw_text'][:200]}\n"
-
-    prompt = f"""You are a task designer for an AI agent behavior dataset.
-Convert each signal below into a clean, executable agent task.
-Focus on API Orchestration and Code Agent tasks.
-
-{numbered}
-
-CRITICAL RULES:
-1. expected_tools MUST be chosen ONLY from this exact list:
-{TOOL_NAMES}
-2. Do NOT invent tool names — only use tools from the list above
-3. Each task needs 2-3 realistic tool calls
-4. Must have at least one realistic failure point
-5. Return null for irrelevant signals
-
-Return ONLY a JSON array with exactly {len(signals)} items:
-[
-  {{
-    "task": "one or two sentence agent task",
-    "difficulty": "simple|medium|complex",
-    "expected_tools": ["web_search", "api_fetch"],
-    "likely_failure_points": ["401 unauthorized", "timeout"],
-    "generation_strategy": "llm_generative",
-    "freshness_source": "source_here"
-  }}
-]"""
-
-    result = call_llm_json("generator", [{"role": "user", "content": prompt}], max_tokens=1200)
-    if isinstance(result, dict):
-        result = [result]
-    if not isinstance(result, list):
-        return []
-    return [_validate_task_tools(r) for r in result if r and isinstance(r, dict) and r.get("task")]
-
-
 def _validate_task_tools(task: dict) -> dict:
-    """Ensure expected_tools only contains registered tool names. Fix invalid ones."""
     tools = task.get("expected_tools", [])
-    valid = [t for t in tools if t in TOOL_NAMES]
+    valid = [tool for tool in tools if tool in REAL_CODING_TOOL_NAMES]
     if not valid:
-        # Assign default tools based on task content
         text = task.get("task", "").lower()
-        if any(k in text for k in ["stripe", "invoice", "payment"]):
-            valid = ["stripe_list_invoices", "api_fetch", "slack_send_message"]
-        elif any(k in text for k in ["github", "issue", "repo"]):
-            valid = ["github_list_issues", "api_fetch", "file_write"]
-        elif any(k in text for k in ["notion", "database"]):
-            valid = ["notion_query_database", "notion_create_page"]
-        elif any(k in text for k in ["code", "script", "debug", "fix"]):
-            valid = ["code_executor", "web_search", "file_write"]
+        if any(k in text for k in ["test", "pytest", "failing", "bug", "fix"]):
+            valid = ["file_search", "code_search", "code_edit", "code_executor"]
+        elif any(k in text for k in ["api", "client", "response", "request"]):
+            valid = ["file_search", "code_search", "code_edit", "api_fetch", "code_executor"]
         else:
-            valid = ["api_fetch", "api_write", "web_search"]
+            valid = ["file_search", "code_search", "code_edit", "code_executor"]
     task["expected_tools"] = valid
     return task
 
 
-def convert_signal_rule_based(signal: dict) -> dict:
-    """Fallback rule-based converter used if LLM call fails."""
-def convert_signal_rule_based(signal: dict) -> dict:
-    """Fallback: rule-based conversion if LLM call fails."""
-    import re
-    text   = (signal["raw_text"] or "").lower()
-    source = (signal["source"] or "").lower()
-    title  = signal["raw_text"].split("\n")[0].strip()[:120]
+def convert_signal_to_task(signal: dict) -> Optional[dict]:
+    prompt = f"""You are creating a repo-grounded coding task for a real coding agent.
 
-    # Detect which service/niche this signal belongs to
-    detected_service = "api"
-    tools            = ["api_fetch", "api_write"]
-    difficulty       = "medium"
-    failures         = ["timeout", "auth error", "malformed response"]
+Repository: {signal.get('repo_full_name', signal.get('source', 'unknown'))}
+Issue URL: {signal.get('source_url', '')}
+Issue title: {signal.get('title', '')}
+Issue labels: {signal.get('issue_labels', [])}
+Path hints: {signal.get('path_hints', [])}
+
+Issue body:
+{signal.get('body', signal.get('raw_text', ''))[:1200]}
+
+Requirements:
+- The task must require repository inspection and code changes.
+- The task must ask the agent to produce execution evidence, ideally targeted tests or another concrete validation command.
+- expected_tools must be chosen only from: {REAL_CODING_TOOL_NAMES}
+- Prefer 3-5 tools, not 1.
+- If the issue does not look locally executable, return null.
+
+Return ONLY JSON:
+{{
+  "task": "two-sentence repo-grounded coding task",
+  "difficulty": "medium|complex",
+  "expected_tools": ["file_search", "code_search", "code_edit", "code_executor"],
+  "likely_failure_points": ["point1", "point2"],
+  "generation_strategy": "llm_generative",
+  "freshness_source": "{signal.get('source', '')}",
+  "execution_target": "real_repo_issue",
+  "task_type": "repo_issue_fix"
+}}"""
+    task = call_llm_json("generator", [{"role": "user", "content": prompt}], max_tokens=400)
+    if not task or not isinstance(task, dict):
+        return None
+    task = _validate_task_tools(task)
+    return _merge_task_metadata(task, signal)
+
+
+def convert_signal_rule_based(signal: dict) -> dict:
+    text = (signal.get("raw_text") or "").lower()
+    source = (signal.get("source") or "").lower()
+    title = signal.get("title") or signal.get("raw_text", "").split("\n")[0].strip()[:160]
+
+    detected_service = "github"
+    tools = ["file_search", "code_search", "code_edit", "code_executor"]
+    difficulty = "complex"
+    failures = ["issue not reproduced locally", "wrong file changed", "validation missing"]
 
     for keyword, mapping in SOURCE_TOOL_MAP.items():
         if keyword in text or keyword in source:
             detected_service = keyword
-            if isinstance(mapping, tuple):
-                tools, difficulty = mapping
-            else:
-                tools = mapping
-                difficulty = "medium"
+            tools, difficulty = mapping
             failures = FAILURE_MAP.get(keyword, failures)
             break
 
-    # Fill a task pattern with the signal context
-    pattern = random.choice(TASK_PATTERNS)
-    task_text = pattern.format(
-        resource=f"data related to {detected_service}",
-        service=detected_service,
-        title=title,
-    )
-
-    return {
-        "task":                  task_text,
-        "difficulty":            difficulty,
-        "expected_tools":        tools,
-        "likely_failure_points": failures[:2],
-        "generation_strategy":   "llm_generative",
-        "freshness_source":      signal["source"],
+    task_text = random.choice(TASK_PATTERNS).format(title=title)
+    task = {
+        "task": task_text,
+        "difficulty": difficulty,
+        "expected_tools": tools,
+        "likely_failure_points": failures[:3],
+        "generation_strategy": "llm_generative",
+        "freshness_source": signal.get("source", "unknown"),
+        "execution_target": signal.get("execution_target", "real_repo_issue"),
+        "task_type": "repo_issue_fix",
     }
+    return _merge_task_metadata(_validate_task_tools(task), signal)
 
 
 def mutate_task_rule_based(seed: dict) -> dict:
-    """
-    Mutate a seed task using pure string manipulation — zero LLM calls.
-    Applies one of 5 mutation types deterministically.
-    """
     mutations = [
-        # (suffix to append, difficulty bump, extra failure)
-        (
-            " Handle the case where the initial API call fails with a 429 and implement exponential backoff.",
-            "complex",
-            "rate limit not handled correctly",
-        ),
-        (
-            " Additionally validate all inputs before processing and return structured error messages for invalid data.",
-            "complex",
-            "input validation missing",
-        ),
-        (
-            " The integration must also log every step to a file and send a Slack notification on completion or failure.",
-            "complex",
-            "notification delivery failure",
-        ),
-        (
-            " Ensure idempotency — if the task is run twice, the second run should detect duplicates and skip them.",
-            "complex",
-            "duplicate records created",
-        ),
-        (
-            " Break this into two agents: one that fetches and validates the data, one that writes and confirms the output.",
-            "complex",
-            "agent coordination failure",
-        ),
+        (" Also capture a failing test or exact validation command before editing, then rerun it after the patch.", "complex", "no before/after validation evidence"),
+        (" Minimize the patch surface and explain which repository files are safe to ignore while debugging.", "complex", "edited unrelated files"),
+        (" Ensure the fix works for the reported issue and a nearby edge case found during code inspection.", "complex", "edge case regression missed"),
+        (" Record the most relevant command outputs so a supervisor can verify the fix is grounded in execution evidence.", "complex", "insufficient execution evidence"),
     ]
-
     suffix, new_difficulty, extra_failure = random.choice(mutations)
-
-    base_task    = seed.get("task", "")
-    base_tools   = seed.get("expected_tools",        ["api_fetch", "api_write"])
-    base_failures= seed.get("likely_failure_points", ["timeout", "auth error"])
-
-    return {
-        "task":                  base_task + suffix,
-        "difficulty":            new_difficulty,
-        "expected_tools":        base_tools,
-        "likely_failure_points": (base_failures + [extra_failure])[:3],
-        "generation_strategy":   "mutation_based",
-        "freshness_source":      "mutation_of_existing",
-        "mutation_type":         "rule_based",
+    base_task = seed.get("task", "")
+    base_tools = seed.get("expected_tools", ["file_search", "code_search", "code_edit", "code_executor"])
+    base_failures = seed.get("likely_failure_points", ["validation missing", "wrong file changed"])
+    task = {
+        "task": base_task + suffix,
+        "difficulty": new_difficulty,
+        "expected_tools": base_tools,
+        "likely_failure_points": (base_failures + [extra_failure])[:4],
+        "generation_strategy": "mutation_based",
+        "freshness_source": "mutation_of_existing",
+        "execution_target": seed.get("execution_target", "real_repo_issue"),
+        "task_type": seed.get("task_type", "repo_issue_fix"),
+        "source_url": seed.get("source_url", ""),
+        "repo_url": seed.get("repo_url", ""),
+        "repo_clone_url": seed.get("repo_clone_url", ""),
+        "repo_full_name": seed.get("repo_full_name", ""),
+        "repo_default_branch": seed.get("repo_default_branch", ""),
+        "repo_language": seed.get("repo_language", ""),
+        "issue_number": seed.get("issue_number"),
+        "issue_title": seed.get("issue_title", ""),
+        "issue_labels": seed.get("issue_labels", []),
+        "path_hints": seed.get("path_hints", []),
     }
+    return _validate_task_tools(task)
 
-
-# ── Task Registry (SQLite) ─────────────────────────────────────────────────────
 
 def init_registry():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS tasks (
-            task_id            TEXT PRIMARY KEY,
-            task               TEXT NOT NULL,
-            difficulty         TEXT,
-            expected_tools     TEXT,
-            failure_points     TEXT,
+            task_id TEXT PRIMARY KEY,
+            task TEXT NOT NULL,
+            difficulty TEXT,
+            expected_tools TEXT,
+            failure_points TEXT,
             generation_strategy TEXT,
-            freshness_source   TEXT,
-            created_at         TEXT,
-            executed_count     INTEGER DEFAULT 0,
-            niche_score        REAL DEFAULT 0.0,
-            status             TEXT DEFAULT 'approved'
+            freshness_source TEXT,
+            source_url TEXT,
+            repo_url TEXT,
+            repo_clone_url TEXT,
+            repo_full_name TEXT,
+            repo_default_branch TEXT,
+            repo_language TEXT,
+            issue_number INTEGER,
+            issue_title TEXT,
+            issue_labels TEXT,
+            path_hints TEXT,
+            execution_target TEXT,
+            task_type TEXT,
+            created_at TEXT,
+            executed_count INTEGER DEFAULT 0,
+            niche_score REAL DEFAULT 0.0,
+            status TEXT DEFAULT 'approved'
         )
     """)
+    existing_cols = {
+        row[1] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()
+    }
+    extra_columns = {
+        "source_url": "TEXT",
+        "repo_url": "TEXT",
+        "repo_clone_url": "TEXT",
+        "repo_full_name": "TEXT",
+        "repo_default_branch": "TEXT",
+        "repo_language": "TEXT",
+        "issue_number": "INTEGER",
+        "issue_title": "TEXT",
+        "issue_labels": "TEXT",
+        "path_hints": "TEXT",
+        "execution_target": "TEXT",
+        "task_type": "TEXT",
+    }
+    for col, col_type in extra_columns.items():
+        if col not in existing_cols:
+            conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {col_type}")
     conn.commit()
     conn.close()
 
 
 def task_fingerprint(task_text: str) -> str:
-    """Create a short hash to detect near-duplicates."""
     return hashlib.md5(task_text.strip().lower().encode()).hexdigest()
 
 
-def is_duplicate(task_text: str, freshness_source: str = "") -> bool:
-    """
-    Duplicate check on both task text hash AND freshness_source.
-    Prevents same GitHub issue appearing twice with slightly different wording.
-    """
+def is_duplicate(task_text: str, freshness_source: str = "", source_url: str = "") -> bool:
     fp = task_fingerprint(task_text)
     conn = sqlite3.connect(DB_PATH)
-    # Check task hash
     row = conn.execute("SELECT 1 FROM tasks WHERE task_id = ?", (fp,)).fetchone()
     if row:
         conn.close()
         return True
-    # Check source URL — same source = likely same task
+    if source_url:
+        row = conn.execute("SELECT 1 FROM tasks WHERE source_url = ?", (source_url,)).fetchone()
+        if row:
+            conn.close()
+            return True
     if freshness_source and freshness_source not in ("template_library", "mutation_of_existing", ""):
-        row = conn.execute(
-            "SELECT 1 FROM tasks WHERE freshness_source = ?", (freshness_source,)
-        ).fetchone()
+        row = conn.execute("SELECT 1 FROM tasks WHERE freshness_source = ?", (freshness_source,)).fetchone()
         if row:
             conn.close()
             return True
@@ -374,15 +332,17 @@ def is_duplicate(task_text: str, freshness_source: str = "") -> bool:
 
 
 def save_task(task: dict) -> bool:
-    """Save a validated task to the registry. Returns True if saved."""
     fp = task_fingerprint(task["task"])
     try:
         conn = sqlite3.connect(DB_PATH)
         conn.execute("""
-            INSERT OR IGNORE INTO tasks
-            (task_id, task, difficulty, expected_tools, failure_points,
-             generation_strategy, freshness_source, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT OR IGNORE INTO tasks (
+                task_id, task, difficulty, expected_tools, failure_points,
+                generation_strategy, freshness_source, source_url, repo_url,
+                repo_clone_url, repo_full_name, repo_default_branch, repo_language,
+                issue_number, issue_title, issue_labels, path_hints,
+                execution_target, task_type, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             fp,
             task["task"],
@@ -391,6 +351,18 @@ def save_task(task: dict) -> bool:
             json.dumps(task.get("likely_failure_points", [])),
             task.get("generation_strategy", "unknown"),
             task.get("freshness_source", "unknown"),
+            task.get("source_url", ""),
+            task.get("repo_url", ""),
+            task.get("repo_clone_url", ""),
+            task.get("repo_full_name", ""),
+            task.get("repo_default_branch", ""),
+            task.get("repo_language", ""),
+            task.get("issue_number"),
+            task.get("issue_title", ""),
+            json.dumps(task.get("issue_labels", [])),
+            json.dumps(task.get("path_hints", [])),
+            task.get("execution_target", "synthetic"),
+            task.get("task_type", "generic_task"),
             datetime.now().strftime("%Y-%m-%d"),
         ))
         conn.commit()
@@ -402,11 +374,13 @@ def save_task(task: dict) -> bool:
 
 
 def load_approved_tasks(limit: int = 100) -> list[dict]:
-    """Load approved tasks from registry, prioritising least-executed ones."""
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute("""
-        SELECT task_id, task, difficulty, expected_tools, failure_points,
-               freshness_source, created_at
+        SELECT
+            task_id, task, difficulty, expected_tools, failure_points,
+            freshness_source, created_at, source_url, repo_url, repo_clone_url,
+            repo_full_name, repo_default_branch, repo_language, issue_number,
+            issue_title, issue_labels, path_hints, execution_target, task_type
         FROM tasks
         WHERE status = 'approved'
         ORDER BY executed_count ASC, created_at DESC
@@ -417,13 +391,25 @@ def load_approved_tasks(limit: int = 100) -> list[dict]:
     tasks = []
     for row in rows:
         tasks.append({
-            "task_id":               row[0],
-            "task":                  row[1],
-            "difficulty":            row[2],
-            "expected_tools":        json.loads(row[3]),
+            "task_id": row[0],
+            "task": row[1],
+            "difficulty": row[2],
+            "expected_tools": json.loads(row[3]),
             "likely_failure_points": json.loads(row[4]),
-            "freshness_source":      row[5],
-            "created_at":            row[6],
+            "freshness_source": row[5],
+            "created_at": row[6],
+            "source_url": row[7] or "",
+            "repo_url": row[8] or "",
+            "repo_clone_url": row[9] or "",
+            "repo_full_name": row[10] or "",
+            "repo_default_branch": row[11] or "",
+            "repo_language": row[12] or "",
+            "issue_number": row[13],
+            "issue_title": row[14] or "",
+            "issue_labels": json.loads(row[15] or "[]"),
+            "path_hints": json.loads(row[16] or "[]"),
+            "execution_target": row[17] or "synthetic",
+            "task_type": row[18] or "generic_task",
         })
     return tasks
 
@@ -432,181 +418,114 @@ def mark_executed(task_id: str):
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
         "UPDATE tasks SET executed_count = executed_count + 1 WHERE task_id = ?",
-        (task_id,)
+        (task_id,),
     )
     conn.commit()
     conn.close()
 
 
 def get_registry_sample(n: int = 5) -> list[dict]:
-    """Return a small sample of existing tasks for mutation."""
     conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute(
-        "SELECT task, difficulty FROM tasks ORDER BY RANDOM() LIMIT ?", (n,)
-    ).fetchall()
+    rows = conn.execute("""
+        SELECT
+            task, difficulty, expected_tools, failure_points, source_url, repo_url,
+            repo_clone_url, repo_full_name, repo_default_branch, repo_language,
+            issue_number, issue_title, issue_labels, path_hints,
+            execution_target, task_type
+        FROM tasks
+        ORDER BY RANDOM()
+        LIMIT ?
+    """, (n,)).fetchall()
     conn.close()
-    return [{"task": r[0], "difficulty": r[1]} for r in rows]
+    return [{
+        "task": row[0],
+        "difficulty": row[1],
+        "expected_tools": json.loads(row[2] or "[]"),
+        "likely_failure_points": json.loads(row[3] or "[]"),
+        "source_url": row[4] or "",
+        "repo_url": row[5] or "",
+        "repo_clone_url": row[6] or "",
+        "repo_full_name": row[7] or "",
+        "repo_default_branch": row[8] or "",
+        "repo_language": row[9] or "",
+        "issue_number": row[10],
+        "issue_title": row[11] or "",
+        "issue_labels": json.loads(row[12] or "[]"),
+        "path_hints": json.loads(row[13] or "[]"),
+        "execution_target": row[14] or "synthetic",
+        "task_type": row[15] or "generic_task",
+    } for row in rows]
 
 
-# ── Quality Gate ───────────────────────────────────────────────────────────────
-
-# Niche keywords for fast rule-based check (no LLM call needed)
 NICHE_KEYWORDS = [
     "api", "stripe", "notion", "github", "slack", "airtable", "shopify",
     "salesforce", "hubspot", "webhook", "endpoint", "request", "response",
     "fetch", "sync", "integrate", "code", "script", "debug", "function",
     "python", "deploy", "pipeline", "automate", "parse", "extract", "transform",
+    "repo", "repository", "test", "pytest", "issue", "patch",
 ]
 
+
 def passes_rule_based_check(task: dict) -> bool:
-    """
-    Fast rule-based quality check — no LLM call, no rate limit risk.
-    Used for template tasks which are already well-structured.
-    """
     if not task or not task.get("task"):
         return False
     text = task["task"].lower()
-    if len(text) < 20:
+    if len(text) < 40:
         return False
-    if is_duplicate(task["task"], task.get("freshness_source", "")):
+    if is_duplicate(task["task"], task.get("freshness_source", ""), task.get("source_url", "")):
         return False
-    # Must contain at least one niche keyword
-    return any(kw in text for kw in NICHE_KEYWORDS)
+    if task.get("execution_target") == "real_repo_issue":
+        if not task.get("repo_full_name") or not task.get("source_url"):
+            return False
+        if len(task.get("expected_tools", [])) < 3:
+            return False
+    return any(keyword in text for keyword in NICHE_KEYWORDS)
 
 
-
-def mutate_tasks_llm(seed_tasks: list[dict]) -> list[dict]:
-    """Mutate a batch of tasks using LLM to create harder, more diverse variants."""
-    from llm_client import call_llm_json
-
-    mutations = [
-        "Add a mid-task failure that requires recovery (e.g. 429 rate limit, auth error).",
-        "Add input validation requirement — agent must handle malformed or missing fields.",
-        "Expand into 2-agent coordination: one fetches data, one writes output.",
-        "Add idempotency requirement — running twice must not create duplicates.",
-        "Add a logging + notification requirement on completion or failure.",
-    ]
-
-    numbered = ""
-    chosen   = []
-    for i, seed in enumerate(seed_tasks):
-        m = random.choice(mutations)
-        chosen.append(m)
-        numbered += f"\n--- Task {i+1} ---\nOriginal: {seed['task']}\nMutation: {m}\n"
-
-    prompt = f"""Mutate each agent task below to create a harder, more diverse variant.
-Apply the specified mutation to each one.
-
-{numbered}
-
-Return ONLY a JSON array with exactly {len(seed_tasks)} items:
-[
-  {{
-    "task": "mutated task description",
-    "difficulty": "complex",
-    "expected_tools": ["tool1", "tool2"],
-    "likely_failure_points": ["point1"],
-    "generation_strategy": "mutation_based",
-    "freshness_source": "mutation_of_existing"
-  }}
-]"""
-
-    result = call_llm_json("generator", [{"role": "user", "content": prompt}], max_tokens=1200)
-    if isinstance(result, dict):
-        result = [result]
-    if not isinstance(result, list):
-        return []
-    return [r for r in result if r and isinstance(r, dict) and r.get("task")]
-
-
-# ── Main Generate Function ─────────────────────────────────────────────────────
-
-# Daily budget breakdown
 DAILY_BUDGET = {
-    "template_based":  4,    # 0 LLM calls (pure template)
-    "llm_generative":  4,    # 4 LLM calls (generator model)
-    "mutation_based":  4,    # 4 LLM calls (generator model)
+    "template_based": 2,
+    "llm_generative": 6,
+    "mutation_based": 4,
 }
-# Total call budget breakdown (3 keys = 150 req/day):
-#   task generation:  8  calls  (4+4 LLM, templates free)
-#   agent execution:  48 calls  (12 tasks × 4 steps)
-#   labeling:         24 calls  (12 tasks × 2: primary+secondary)
-#   buffer:           70 calls  (retries, quality checks)
-#   TOTAL:           ~150 calls — fits exactly
+
 
 def generate_tasks(total: int = 100) -> list[dict]:
-    """
-    Full task generation run.
-    Returns list of validated tasks ready for agent execution.
-
-    Rate-limit strategy:
-      template_based  → rule-based check only, zero LLM calls
-      llm_generative  → rule-based keyword matching, ZERO LLM calls
-      mutation_based  → batched LLM calls, 5s delay between batches
-    """
     init_registry()
     approved = []
 
-    # ── Strategy 1: Template-based (zero LLM calls) ───────────────────────────
     print("\n📋 Strategy 1: Template-based generation...")
-    template_tasks = generate_template_tasks(count=DAILY_BUDGET["template_based"] + 10)
-    for t in template_tasks:
+    template_tasks = generate_template_tasks(count=DAILY_BUDGET["template_based"] + 6)
+    for task in template_tasks:
         if len([x for x in approved if x.get("generation_strategy") == "template_based"]) >= DAILY_BUDGET["template_based"]:
             break
-        if passes_rule_based_check(t):
-            save_task(t)
-            approved.append(t)
+        if passes_rule_based_check(task):
+            save_task(task)
+            approved.append(task)
     print(f"  ✅ Template tasks approved: {len([x for x in approved if x.get('generation_strategy') == 'template_based'])}")
 
-    # ── Strategy 2: LLM-generative from real signals (rule-based fallback) ──────
-    print("\n🌐 Strategy 2: LLM-generative from real-world signals...")
-    signals   = collect_all_signals()
+    print("\n🌐 Strategy 2: Repo-grounded GitHub issue tasks...")
+    signals = collect_all_signals()
     llm_count = 0
     for signal in signals:
         if llm_count >= DAILY_BUDGET["llm_generative"]:
             break
-        # Try LLM first — fall back to rule-based if it fails
         task = convert_signal_to_task(signal)
         if task is None:
             task = convert_signal_rule_based(signal)
         if task and passes_rule_based_check(task):
             save_task(task)
+            mark_signal_used(signal)
             approved.append(task)
             llm_count += 1
-    print(f"  ✅ Signal-based tasks approved: {llm_count}")
+    print(f"  ✅ Repo-grounded tasks approved: {llm_count}")
 
-    # ── Strategy 3: LLM mutation (rule-based fallback) ───────────────────────────
     print("\n🔀 Strategy 3: Mutation-based generation...")
-    seed_tasks     = get_registry_sample(n=DAILY_BUDGET["mutation_based"] + 5)
+    seed_tasks = [seed for seed in get_registry_sample(n=DAILY_BUDGET["mutation_based"] + 6) if seed.get("execution_target") == "real_repo_issue"]
     mutation_count = 0
-    mutations = [
-        "Add a mid-task failure that requires exponential backoff recovery.",
-        "Add input validation and structured error messages for all edge cases.",
-        "The agent must also send a Slack notification on completion or failure.",
-        "Ensure idempotency — detect and skip duplicates on repeat runs.",
-        "Expand to 2-agent coordination: one fetches/validates, one writes/confirms.",
-    ]
     for seed in seed_tasks:
         if mutation_count >= DAILY_BUDGET["mutation_based"]:
             break
-        mutation = random.choice(mutations)
-        prompt = f"""Mutate this agent task to be harder and more realistic:
-
-Original: {seed['task']}
-Mutation to apply: {mutation}
-
-Return ONLY JSON:
-{{
-  "task": "mutated task (1-2 sentences)",
-  "difficulty": "complex",
-  "expected_tools": ["tool1", "tool2"],
-  "likely_failure_points": ["point1"],
-  "generation_strategy": "mutation_based",
-  "freshness_source": "mutation_of_existing"
-}}"""
-        task = call_llm_json("generator", [{"role": "user", "content": prompt}], max_tokens=250)
-        if task is None:
-            task = mutate_task_rule_based(seed)
+        task = mutate_task_rule_based(seed)
         if task and passes_rule_based_check(task):
             save_task(task)
             approved.append(task)

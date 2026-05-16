@@ -78,8 +78,19 @@ def flatten_record(record: dict) -> dict:
         "freshness_source":            record["task"].get("freshness_source", ""),
         "source_url":                  (
             record["task"].get("source_url") or
-            f"template:{record['task'].get('freshness_source','unknown')}" if record["task"].get("generation_strategy") in ("template_based","mutation_based") else ""
+            (f"template:{record['task'].get('freshness_source','unknown')}" if record["task"].get("generation_strategy") in ("template_based", "mutation_based") else "")
         ),
+        "repo_url":                    record["task"].get("repo_url", ""),
+        "repo_clone_url":              record["task"].get("repo_clone_url", ""),
+        "repo_full_name":              record["task"].get("repo_full_name", ""),
+        "repo_default_branch":         record["task"].get("repo_default_branch", ""),
+        "repo_language":               record["task"].get("repo_language", ""),
+        "issue_number":                record["task"].get("issue_number"),
+        "issue_title":                 record["task"].get("issue_title", ""),
+        "issue_labels":                json.dumps(record["task"].get("issue_labels", [])),
+        "path_hints":                  json.dumps(record["task"].get("path_hints", [])),
+        "execution_target":            record["task"].get("execution_target", "synthetic"),
+        "task_type":                   record["task"].get("task_type", "generic_task"),
 
         # ── Trace ─────────────────────────────────────────────────────────────
         "trace_json":                  json.dumps(record.get("trace", [])),
