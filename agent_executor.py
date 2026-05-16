@@ -1,134 +1,378 @@
 """
 agent_executor.py
-Fixes applied:
-1. ALL tools that LLM generates are registered with realistic responses
-2. Unknown tools get auto-registered with a sensible mock (never "tool not found")
-3. 40% of traces are forced-success with clean final_answer
-4. Multiple agent models + temperatures for diversity
-5. reward_signal removed from executor — labeler owns it exclusively
+
+Execution layer for dataset generation.
+
+- Synthetic tasks still use the legacy mocked ReAct executor.
+- Repo-grounded GitHub issue tasks now use a real workspace runner:
+  clone repo, inspect files, run shell commands, capture command output,
+  and record diff evidence.
+
+This is the first real-execution step. It does not yet implement autonomous
+patch authoring, so repo-grounded runs are intentionally conservative and are
+marked based on actual evidence rather than optimistic completion claims.
 """
 
 import json
-import uuid
-import time
+import os
 import random
+import re
+import shutil
+import subprocess
+import time
+import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
+
 from llm_client import call_llm
 
-PROMPT_TEMPLATE_VERSION = "v3.0"
+PROMPT_TEMPLATE_VERSION = "v4.0"
+EXECUTION_ROOT = Path(__file__).resolve().parent / "registry" / "execution_workspace"
+REAL_AGENT_MAX_STEPS = 6
+MAX_COMMAND_OUTPUT_CHARS = 4000
 
-# Temperature pool — varied per task for dataset diversity
+# Temperature pool for synthetic traces only.
 AGENT_TEMPERATURES = [0.0, 0.2, 0.4, 0.4, 0.6, 0.7]
 
-# ── Agent model pool for diversity ────────────────────────────────────────────
-AGENT_MODELS = [
-    ("agent",        0.3),   # Nemotron Super, deterministic
-    ("agent",        0.6),   # Nemotron Super, creative
-    ("agent_backup", 0.4),   # Gemma backup
-]
 
-# ── Master tool registry ──────────────────────────────────────────────────────
-# Every tool the LLM might request. "tool not found" should never happen again.
+def _safe_slug(text: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", (text or "").strip())
+    slug = slug.strip("-._")
+    return slug[:80] or "repo"
+
+
+def _search_terms_from_task(task: dict) -> list[str]:
+    terms = []
+    if task.get("path_hints"):
+        for hint in task.get("path_hints", []):
+            parts = [p for p in re.split(r"[\\/]", str(hint)) if p]
+            if parts:
+                terms.append(parts[-1][:80])
+    title = task.get("issue_title") or task.get("task", "")
+    for token in re.findall(r"[A-Za-z_][A-Za-z0-9_./-]{3,}", title):
+        if token.lower() in {"issue", "github", "repository", "debug", "fix"}:
+            continue
+        terms.append(token[:80])
+    deduped = []
+    seen = set()
+    for term in terms:
+        key = term.lower()
+        if key not in seen:
+            seen.add(key)
+            deduped.append(term)
+    return deduped[:6]
+
+
+def _truncate(text: str, limit: int = MAX_COMMAND_OUTPUT_CHARS) -> str:
+    text = text or ""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n...[truncated]"
+
+
+def _run_ps(command: str, cwd: Path, timeout_s: int = 90) -> dict:
+    start = time.time()
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", command],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+        stdout = _truncate(proc.stdout)
+        stderr = _truncate(proc.stderr)
+        ok = proc.returncode == 0
+        return {
+            "command": command,
+            "cwd": str(cwd),
+            "exit_code": proc.returncode,
+            "stdout": stdout,
+            "stderr": stderr,
+            "ok": ok,
+            "duration_seconds": round(time.time() - start, 2),
+        }
+    except subprocess.TimeoutExpired as e:
+        return {
+            "command": command,
+            "cwd": str(cwd),
+            "exit_code": 124,
+            "stdout": _truncate((e.stdout or "") if isinstance(e.stdout, str) else ""),
+            "stderr": _truncate((e.stderr or "") if isinstance(e.stderr, str) else "command timed out"),
+            "ok": False,
+            "duration_seconds": round(time.time() - start, 2),
+        }
+    except Exception as e:
+        return {
+            "command": command,
+            "cwd": str(cwd),
+            "exit_code": 1,
+            "stdout": "",
+            "stderr": str(e),
+            "ok": False,
+            "duration_seconds": round(time.time() - start, 2),
+        }
+
+
+def _workspace_for_task(task: dict, trace_id: str) -> Path:
+    repo_name = task.get("repo_full_name") or task.get("repo_url") or "repo"
+    slug = _safe_slug(repo_name.replace("/", "-"))
+    return EXECUTION_ROOT / f"{slug}-{trace_id[-8:]}"
+
+
+def _prepare_repo_workspace(task: dict, trace_id: str) -> tuple[Path, list[dict], dict]:
+    EXECUTION_ROOT.mkdir(parents=True, exist_ok=True)
+    workspace = _workspace_for_task(task, trace_id)
+    if workspace.exists():
+        shutil.rmtree(workspace, ignore_errors=True)
+    workspace.parent.mkdir(parents=True, exist_ok=True)
+
+    repo_url = task.get("repo_clone_url") or task.get("repo_url")
+    default_branch = task.get("repo_default_branch") or "main"
+    commands = []
+
+    if not repo_url:
+        return workspace, commands, {
+            "repo_prepared": False,
+            "repo_prepare_error": "missing_repo_url",
+            "repo_workspace": str(workspace),
+        }
+
+    clone_cmd = f"git clone --depth 1 --branch {default_branch} {repo_url} '{workspace.name}'"
+    clone_result = _run_ps(clone_cmd, EXECUTION_ROOT, timeout_s=240)
+    commands.append(clone_result)
+    if not clone_result["ok"]:
+        return workspace, commands, {
+            "repo_prepared": False,
+            "repo_prepare_error": f"clone_failed:{clone_result['exit_code']}",
+            "repo_workspace": str(workspace),
+        }
+
+    git_rev = _run_ps("git rev-parse HEAD", workspace, timeout_s=30)
+    commands.append(git_rev)
+    return workspace, commands, {
+        "repo_prepared": True,
+        "repo_prepare_error": "",
+        "repo_workspace": str(workspace),
+        "repo_commit": (git_rev.get("stdout") or "").strip(),
+    }
+
+
+def _real_repo_prompt(task: dict, command_results: list[dict]) -> str:
+    inspected = []
+    for result in command_results[-4:]:
+        inspected.append({
+            "command": result["command"],
+            "exit_code": result["exit_code"],
+            "stdout": result["stdout"][:500],
+            "stderr": result["stderr"][:200],
+        })
+    return f"""You are supervising a real coding-agent attempt on a GitHub issue.
+
+Task:
+{task.get("task", "")}
+
+Repository: {task.get("repo_full_name", "")}
+Issue URL: {task.get("source_url", "")}
+Path hints: {task.get("path_hints", [])}
+
+Recent command evidence:
+{json.dumps(inspected, indent=2)}
+
+Return ONLY JSON:
+{{
+  "summary": "1-2 sentence grounded assessment of what the next coding step should be",
+  "candidate_files": ["path/or/file.py"],
+  "candidate_validation_commands": ["pytest tests/test_x.py -k something"],
+  "confidence": "low|medium|high"
+}}"""
+
+
+def _run_real_repo_task(task: dict) -> dict:
+    trace_id = f"trace_{datetime.now().strftime('%Y%m%d')}_{uuid.uuid4().hex[:8]}"
+    start_time = time.time()
+    steps = []
+    commands = []
+    workspace, prep_commands, prep_meta = _prepare_repo_workspace(task, trace_id)
+    commands.extend(prep_commands)
+
+    for cmd in prep_commands:
+        steps.append({
+            "step": len(steps) + 1,
+            "type": "command",
+            "command": cmd["command"],
+            "result": cmd,
+        })
+
+    if not prep_meta.get("repo_prepared"):
+        return {
+            "trace_id": trace_id,
+            "created_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "task": task,
+            "trace": steps,
+            "outcome": {
+                "status": "failed",
+                "total_steps": len(steps),
+                "total_tool_calls": len(commands),
+                "tools_used": ["git"] if commands else [],
+                "failure_occurred": True,
+                "failure_reason": prep_meta.get("repo_prepare_error", "repo_prepare_failed"),
+                "final_answer": "",
+                "duration_seconds": round(time.time() - start_time, 2),
+                "execution_grounded": bool(commands),
+                "files_changed": [],
+                "validation_commands": [],
+                "command_history": commands,
+            },
+            "metadata": {
+                "agent_framework": "repo_runner",
+                "agent_model": "real-repo-runner/bootstrap",
+                "agent_temperature": 0.0,
+                "prompt_template_version": PROMPT_TEMPLATE_VERSION,
+                "token_count_input": 0,
+                "token_count_output": 0,
+                "world_context_date": datetime.now().strftime("%Y-%m-%d"),
+                "schema_version": "v4.0",
+                **prep_meta,
+            },
+        }
+
+    inspection_commands = [
+        "git status --short",
+        "Get-ChildItem -Name | Select-Object -First 40",
+        "rg --files | Select-Object -First 120",
+    ]
+    search_terms = _search_terms_from_task(task)
+    for term in search_terms[:3]:
+        escaped = term.replace("'", "''")
+        inspection_commands.append(f"rg -n --hidden --glob '!*.git*' '{escaped}' .")
+
+    for command in inspection_commands[:REAL_AGENT_MAX_STEPS]:
+        result = _run_ps(command, workspace, timeout_s=90)
+        commands.append(result)
+        steps.append({
+            "step": len(steps) + 1,
+            "type": "command",
+            "command": command,
+            "result": result,
+        })
+
+    prompt = _real_repo_prompt(task, commands)
+    model_resp = call_llm(
+        "agent",
+        [{"role": "user", "content": prompt}],
+        temperature=0.0,
+        max_tokens=500,
+    )
+    token_out = len((model_resp or "").split())
+    token_in = len(prompt.split())
+    agent_summary = ""
+    candidate_files = []
+    validation_commands = []
+    if model_resp:
+        try:
+            parsed = json.loads(model_resp.strip().strip("`"))
+        except json.JSONDecodeError:
+            parsed = {"summary": model_resp}
+        agent_summary = parsed.get("summary", "")
+        candidate_files = parsed.get("candidate_files", []) or []
+        validation_commands = parsed.get("candidate_validation_commands", []) or []
+        steps.append({
+            "step": len(steps) + 1,
+            "type": "reasoning",
+            "content": agent_summary,
+            "candidate_files": candidate_files[:6],
+            "candidate_validation_commands": validation_commands[:4],
+        })
+
+    diff_name_only = _run_ps("git diff --name-only", workspace, timeout_s=30)
+    commands.append(diff_name_only)
+    changed_files = [
+        line.strip() for line in (diff_name_only.get("stdout") or "").splitlines() if line.strip()
+    ]
+
+    outcome_status = "partial"
+    failure_reason = "no_code_changes_applied_yet"
+    final_answer = (
+        "Repository prepared and inspected with real shell evidence, but no patch was applied yet. "
+        "This run is grounded and suitable for supervision, but not a completed issue fix."
+    )
+    if changed_files:
+        outcome_status = "success"
+        failure_reason = None
+        final_answer = "Repository inspection and code changes were captured in the workspace."
+
+    return {
+        "trace_id": trace_id,
+        "created_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "task": task,
+        "trace": steps,
+        "outcome": {
+            "status": outcome_status,
+            "total_steps": len(steps),
+            "total_tool_calls": len(commands),
+            "tools_used": ["git", "code_search", "code_executor"],
+            "failure_occurred": outcome_status != "success",
+            "failure_reason": failure_reason,
+            "final_answer": final_answer,
+            "duration_seconds": round(time.time() - start_time, 2),
+            "execution_grounded": True,
+            "files_changed": changed_files,
+            "validation_commands": validation_commands[:4],
+            "command_history": commands,
+        },
+        "metadata": {
+            "agent_framework": "repo_runner",
+            "agent_model": "groq/llama-3.3-70b-versatile",
+            "agent_temperature": 0.0,
+            "prompt_template_version": PROMPT_TEMPLATE_VERSION,
+            "token_count_input": int(token_in),
+            "token_count_output": int(token_out),
+            "world_context_date": datetime.now().strftime("%Y-%m-%d"),
+            "schema_version": "v4.0",
+            **prep_meta,
+            "candidate_files": candidate_files[:6],
+        },
+    }
+
+
+# ---- legacy synthetic executor path ----
 
 def _make_tool_registry(task: str):
-    """
-    Build a tool registry keyed by tool name.
-    Any tool not explicitly listed gets an auto-mock.
-    """
-    task_lower = task.lower()
-
     def web_search(inp):
         q = inp.get("query", task[:60])
-        ql = q.lower()
-        if any(k in ql for k in ["429", "rate limit"]):
-            return {"results": [{"title": "Handle 429 with exponential backoff", "snippet": "Use Retry-After header. Implement backoff: wait 2^n seconds.", "url": "https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/429"}]}
-        if any(k in ql for k in ["stripe", "invoice", "payment"]):
-            return {"results": [{"title": "Stripe Invoices API", "snippet": "GET /v1/invoices?status=open&limit=100. Paginate with has_more.", "url": "https://stripe.com/docs/api/invoices"}]}
-        if any(k in ql for k in ["github", "repo", "pull", "issue"]):
-            return {"results": [{"title": "GitHub REST API", "snippet": "GET /repos/{owner}/{repo}/issues. Auth with Bearer token.", "url": "https://docs.github.com/rest"}]}
-        if any(k in ql for k in ["notion", "database", "page"]):
-            return {"results": [{"title": "Notion API", "snippet": "POST /v1/pages with parent.database_id and properties dict.", "url": "https://developers.notion.com"}]}
-        if any(k in ql for k in ["async", "sync", "await", "coroutine"]):
-            return {"results": [{"title": "Python asyncio docs", "snippet": "Use await with async def. Sync calls in async context need asyncio.run_in_executor().", "url": "https://docs.python.org/3/library/asyncio.html"}]}
-        if any(k in ql for k in ["crewai", "crew", "flow"]):
-            return {"results": [{"title": "CrewAI Flows docs", "snippet": "Use @flow decorator for class-level state. Router methods control flow between steps.", "url": "https://docs.crewai.com/concepts/flows"}]}
-        if any(k in ql for k in ["langchain", "agent", "tool"]):
-            return {"results": [{"title": "LangChain Agent docs", "snippet": "create_react_agent takes llm, tools, prompt. Tools must have name, description, func.", "url": "https://python.langchain.com/docs/agents"}]}
-        # Generic but realistic
         keywords = q.split()[:3]
-        return {"results": [
-            {"title": f"{' '.join(keywords)} — Official Documentation", "snippet": f"Complete reference for {q}. See authentication, endpoints, and error codes.", "url": f"https://docs.example.com/{keywords[0].lower() if keywords else 'api'}"},
-            {"title": f"Stack Overflow: {q[:50]}", "snippet": "Multiple solutions. Top answer suggests checking request method and headers.", "url": "https://stackoverflow.com/search?q=" + "+".join(keywords)},
-        ]}
+        return {
+            "results": [
+                {
+                    "title": f"{' '.join(keywords)} - Documentation",
+                    "snippet": f"Reference material for {q}",
+                    "url": "https://docs.example.com",
+                }
+            ]
+        }
 
-    registry = {
-        # ── Web & Search ─────────────────────────────────────────────────────
-        "web_search":   web_search,
-
-        # ── File operations ──────────────────────────────────────────────────
-        "file_search":  lambda i: {"matches": [{"file": "src/agent.py", "line": 42, "content": f"Found '{i.get('query','')}'in function _export_output"}, {"file": "src/utils.py", "line": 18, "content": "Related helper function"}]},
-        "file_edit":    lambda i: {"status": "success", "file": i.get("file","unknown.py"), "changes_applied": 1, "backup": i.get("file","f")+".bak"},
-        "file_read":    lambda i: {"content": f"# File: {i.get('path','')}\ndef example():\n    pass\n", "lines": 3},
-
-        # ── Code operations ──────────────────────────────────────────────────
-        "code_search":  lambda i: {"matches": [{"file": "src/main.py", "line": 77, "snippet": f"def {i.get('query','function')}(self): ..."}], "total": 1},
-        "code_view":    lambda i: {"content": f"# {i.get('file','')}\ndef example_function():\n    result = api_call()\n    return result\n", "language": "python"},
-        "code_edit":    lambda i: {"status": "success", "diff": f"- old_code\n+ new_code", "file": i.get("file","main.py")},
-        "code_executor":lambda i: {"stdout": "Script executed successfully\nOutput: OK", "stderr": "", "exit_code": 0},
-        "git":          lambda i: {"status": "success", "output": f"git {i.get('command','status')}: OK", "branch": "main"},
-
-        # ── API calls ────────────────────────────────────────────────────────
-        "api_fetch":    lambda i: {"status_code": 200, "data": {"items": [{"id": "item_1", "status": "active", "value": 100}], "total": 1, "has_more": False}},
-        "api_write":    lambda i: {"status_code": 201, "data": {"id": f"new_{uuid.uuid4().hex[:8]}", "status": "created"}},
-        "api_client":   lambda i: {"status": "connected", "base_url": i.get("base_url","https://api.example.com"), "response": {"ok": True}},
-
-        # ── Stripe ───────────────────────────────────────────────────────────
-        "stripe_api":   lambda i: {"invoices": [{"id": "in_001", "customer": "Acme", "amount_due": 4500, "due_date": "2026-03-15", "status": "open"}], "has_more": False},
-        "stripe_list_invoices": lambda i: {"invoices": [{"id": "in_001", "customer": "Acme", "amount_due": 4500}], "has_more": False},
-
-        # ── Notion ───────────────────────────────────────────────────────────
-        "notion_create_page": lambda i: {"page_id": f"pg_{uuid.uuid4().hex[:8]}", "status": "success", "url": "https://notion.so/page/xxx"},
-
-        # ── HubSpot ──────────────────────────────────────────────────────────
-        "hubspot_api":  lambda i: {"contacts": [{"id": "c_001", "name": "Acme Corp", "balance": 4500}], "total": 1},
-
-        # ── Airtable ─────────────────────────────────────────────────────────
-        "airtable_api": lambda i: {"id": f"rec_{uuid.uuid4().hex[:6]}", "status": "created", "fields": i.get("fields", {})},
-        "airtable_create_record": lambda i: {"id": f"rec_{uuid.uuid4().hex[:6]}", "status": "created"},
-
-        # ── GitHub ───────────────────────────────────────────────────────────
-        "github_api":   lambda i: {"issues": [{"number": 101, "title": "Bug: agent loop", "state": "open"}]},
-        "github_list_issues": lambda i: {"issues": [{"number": 101, "title": "Bug fix needed"}]},
-
-        # ── Slack ────────────────────────────────────────────────────────────
-        "slack_api":    lambda i: {"ok": True, "ts": "1712345678.000100", "channel": i.get("channel","#general")},
-        "slack_send_message": lambda i: {"ok": True},
-
-        # ── LLM/AI tools ─────────────────────────────────────────────────────
-        "openai_api":   lambda i: {"choices": [{"message": {"content": "LLM response: task completed"}}], "usage": {"total_tokens": 150}},
-        "huggingface_api": lambda i: {"model": i.get("model","bert"), "status": "loaded", "inference_ready": True},
-        "litellm_config": lambda i: {"status": "configured", "model": i.get("model","gpt-4"), "api_base": i.get("api_base","https://api.openai.com/v1")},
-
-        # ── Utility tools ────────────────────────────────────────────────────
-        "calculate_token_count": lambda i: {"token_count": len(str(i.get("text","")).split()) * 1.3, "model": i.get("model","gpt-4"), "within_limit": True},
-        "split_query_by_token_limit": lambda i: {"chunks": [str(i.get("text",""))[:100], str(i.get("text",""))[100:200]], "total_chunks": 2},
-        "retry_handler":  lambda i: {"status": "success", "attempts": 2, "final_result": {"ok": True}},
-        "input_validator": lambda i: {"valid": True, "errors": [], "sanitized": i},
-        "logger":         lambda i: {"logged": True, "level": i.get("level","INFO"), "message": i.get("message","")},
-        "webhook_handler": lambda i: {"status": "received", "event": i.get("event",""), "processed": True},
-        "notification":   lambda i: {"sent": True, "channel": i.get("channel","email")},
-        "documentation_editor": lambda i: {"status": "updated", "file": i.get("file","README.md"), "changes": 1},
+    return {
+        "web_search": web_search,
+        "file_search": lambda i: {"matches": [{"file": "src/agent.py", "line": 42, "content": f"Found {i.get('query', '')}"}]},
+        "file_edit": lambda i: {"status": "success", "file": i.get("file", "unknown.py")},
+        "file_read": lambda i: {"content": f"# File: {i.get('path', '')}\ndef example():\n    pass\n", "lines": 3},
+        "code_search": lambda i: {"matches": [{"file": "src/main.py", "line": 77, "snippet": f"def {i.get('query', 'function')}(self): ..."}], "total": 1},
+        "code_view": lambda i: {"content": f"# {i.get('file', '')}\ndef example_function():\n    result = api_call()\n    return result\n", "language": "python"},
+        "code_edit": lambda i: {"status": "success", "diff": "- old_code\n+ new_code", "file": i.get("file", "main.py")},
+        "code_executor": lambda i: {"stdout": "Script executed successfully\nOutput: OK", "stderr": "", "exit_code": 0},
+        "git": lambda i: {"status": "success", "output": f"git {i.get('command', 'status')}: OK", "branch": "main"},
+        "api_fetch": lambda i: {"status_code": 200, "data": {"items": [{"id": "item_1", "status": "active", "value": 100}], "total": 1, "has_more": False}},
+        "api_write": lambda i: {"status_code": 201, "data": {"id": f"new_{uuid.uuid4().hex[:8]}", "status": "created"}},
     }
-    return registry
 
 
 def _auto_mock(tool_name: str, tool_input: dict) -> dict:
-    """For any unregistered tool, return a generic success response."""
     return {
-        "status":  "success",
-        "tool":    tool_name,
-        "result":  f"Operation completed for {tool_name}",
+        "status": "success",
+        "tool": tool_name,
+        "result": f"Operation completed for {tool_name}",
         "input_received": list(tool_input.keys()),
     }
 
@@ -141,8 +385,8 @@ def simulate_tool_call(tool_name: str, tool_input: dict, task: str, inject_failu
             {"error": "422 Unprocessable", "message": "Missing required field"},
         ])
     registry = _make_tool_registry(task)
-    handler  = registry.get(tool_name, lambda i: _auto_mock(tool_name, i))
-    result   = handler(tool_input)
+    handler = registry.get(tool_name, lambda i: _auto_mock(tool_name, i))
+    result = handler(tool_input)
     result["_tool"] = tool_name
     return result
 
@@ -150,17 +394,9 @@ def simulate_tool_call(tool_name: str, tool_input: dict, task: str, inject_failu
 def build_system_prompt(expected_tools: list) -> str:
     tools_str = ", ".join(expected_tools) if expected_tools else "any available tool"
     return f"""You are an expert AI agent for API Orchestration and Code tasks.
-Solve tasks step by step using Thought → Action → Observation (ReAct pattern).
+Solve tasks step by step using Thought -> Action -> Observation.
 
 REQUIRED: You MUST use these tools for this task: {tools_str}
-Do NOT default to web_search if a more specific tool is available.
-
-Available tools (all work, none return "not found"):
-web_search, file_search, file_edit, file_read, code_search, code_view, code_edit,
-code_executor, git, api_fetch, api_write, api_client, stripe_api, notion_create_page,
-hubspot_api, airtable_api, github_api, slack_api, openai_api, huggingface_api,
-litellm_config, calculate_token_count, split_query_by_token_limit, retry_handler,
-input_validator, logger, webhook_handler, documentation_editor
 
 For EACH step respond ONLY with JSON:
 {{
@@ -168,50 +404,35 @@ For EACH step respond ONLY with JSON:
   "action": "tool_name OR finish",
   "action_input": {{"key": "value"}},
   "final_answer": "only when action=finish"
-}}
-
-Rules:
-- Use the REQUIRED tools above, not just web_search
-- Maximum 4 steps
-- When done: action="finish" with a clear final_answer summary
-- If a tool returns an error, try a different approach"""
+}}"""
 
 
-def run_agent_on_task(task: dict, force_success: bool = False) -> dict:
-    """
-    Run ReAct agent on a single task.
-    force_success=True: injects finish step at step 5 to guarantee success record.
-    max_steps=6 for real GitHub issue complexity.
-    """
-    trace_id   = f"trace_{datetime.now().strftime('%Y%m%d')}_{uuid.uuid4().hex[:8]}"
-    expected   = task.get("expected_tools", [])
-    model_role = random.choice(["agent", "agent", "agent_backup"])  # 2:1 ratio
-    temp       = 0.0 if force_success else random.choice(AGENT_TEMPERATURES)
+def _run_synthetic_task(task: dict, force_success: bool = False) -> dict:
+    trace_id = f"trace_{datetime.now().strftime('%Y%m%d')}_{uuid.uuid4().hex[:8]}"
+    expected = task.get("expected_tools", [])
+    model_role = random.choice(["agent", "agent", "agent_backup"])
+    temp = 0.0 if force_success else random.choice(AGENT_TEMPERATURES)
 
-    messages   = [{"role": "system", "content": build_system_prompt(expected)}]
+    messages = [{"role": "system", "content": build_system_prompt(expected)}]
     messages.append({"role": "user", "content": f"Complete this task:\n\n{task['task']}"})
 
-    steps           = []
+    steps = []
     tool_calls_made = []
-    outcome_status  = "failed"
-    failure_reason  = "max_steps_reached"
-    final_answer    = None
-    input_tokens    = 0
-    output_tokens   = 0
-    start_time      = time.time()
-    failure_rate    = 0.0 if force_success else 0.15
-    max_steps       = 6
+    outcome_status = "failed"
+    failure_reason = "max_steps_reached"
+    final_answer = None
+    input_tokens = 0
+    output_tokens = 0
+    start_time = time.time()
+    failure_rate = 0.0 if force_success else 0.15
+    max_steps = 6
 
     for step_num in range(1, max_steps + 1):
-
-        # ── Force finish at step 5 for guaranteed-success traces ──────────────
         if force_success and step_num == max_steps - 1 and outcome_status != "success":
             tools_summary = ", ".join(set(tool_calls_made)) if tool_calls_made else "api_fetch, web_search"
-            task_short    = task["task"][:100]
-            final_answer  = (
-                f"Successfully completed: {task_short}. "
-                f"Executed {len(tool_calls_made)} tool call(s) using {tools_summary}. "
-                f"All required operations executed and results verified."
+            final_answer = (
+                f"Successfully completed: {task['task'][:100]}. "
+                f"Executed {len(tool_calls_made)} tool call(s) using {tools_summary}."
             )
             steps.append({"step": step_num, "type": "finish", "content": final_answer})
             outcome_status = "success"
@@ -225,7 +446,7 @@ def run_agent_on_task(task: dict, force_success: bool = False) -> dict:
             failure_reason = "model_unavailable"
             break
 
-        input_tokens  += len(" ".join(m["content"] for m in messages).split()) * 1.3
+        input_tokens += len(" ".join(m["content"] for m in messages).split()) * 1.3
         output_tokens += len(raw.split()) * 1.3
 
         try:
@@ -238,35 +459,34 @@ def run_agent_on_task(task: dict, force_success: bool = False) -> dict:
         except json.JSONDecodeError:
             agent_resp = {"thought": raw, "action": "reasoning_only", "action_input": {}}
 
-        thought        = agent_resp.get("thought", "")
-        action         = agent_resp.get("action", "")
-        action_input   = agent_resp.get("action_input", {})
+        thought = agent_resp.get("thought", "")
+        action = agent_resp.get("action", "")
+        action_input = agent_resp.get("action_input", {})
         reasoning_step = {"step": step_num, "type": "reasoning", "content": thought}
 
         if action == "finish":
-            final_answer   = agent_resp.get("final_answer", "Task completed.")
+            final_answer = agent_resp.get("final_answer", "Task completed.")
             outcome_status = "success"
             failure_reason = None
             steps.append(reasoning_step)
             steps.append({"step": step_num, "type": "finish", "content": final_answer})
             break
 
-        elif action and action != "reasoning_only":
-            inject      = random.random() < failure_rate
+        if action and action != "reasoning_only":
+            inject = random.random() < failure_rate
             tool_result = simulate_tool_call(action, action_input, task["task"], inject_failure=inject)
-            latency_ms  = random.randint(120, 450)
             tool_calls_made.append(action)
-
             steps.append(reasoning_step)
             steps.append({
-                "step": step_num, "type": "tool_call",
-                "tool": action, "arguments": action_input,
-                "result": tool_result, "latency_ms": latency_ms,
+                "step": step_num,
+                "type": "tool_call",
+                "tool": action,
+                "arguments": action_input,
+                "result": tool_result,
+                "latency_ms": random.randint(120, 450),
             })
-
             if "error" in tool_result:
                 failure_reason = f"tool_error:{action}"
-
             messages.append({"role": "assistant", "content": raw})
             messages.append({"role": "user", "content": f"Tool result:\n{json.dumps(tool_result)}\nContinue."})
         else:
@@ -275,66 +495,72 @@ def run_agent_on_task(task: dict, force_success: bool = False) -> dict:
             messages.append({"role": "user", "content": "Continue with the next step."})
 
     duration_s = round(time.time() - start_time, 2)
-
-    # Validate success — must have at least one tool call OR explicit final_answer
-    if outcome_status == "success":
-        if len(tool_calls_made) == 0 and not final_answer:
-            outcome_status = "failed"
-            failure_reason = "hallucinated_completion"
-        elif len(tool_calls_made) == 0 and not force_success:
-            outcome_status = "partial"
-            failure_reason = "no_tool_calls_made"
-
+    if outcome_status == "success" and len(tool_calls_made) == 0 and not force_success:
+        outcome_status = "partial"
+        failure_reason = "no_tool_calls_made"
     if outcome_status != "success":
-        has_err = any("error" in str(s.get("result","")) for s in steps if s.get("type") == "tool_call")
+        has_err = any("error" in str(s.get("result", "")) for s in steps if s.get("type") == "tool_call")
         outcome_status = "partial" if (has_err or len(tool_calls_made) > 0) else "failed"
         if has_err:
             failure_reason = "tool_error_unrecovered"
 
     return {
-        "trace_id":   trace_id,
+        "trace_id": trace_id,
         "created_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "task":       task,
-        "trace":      steps,
+        "task": task,
+        "trace": steps,
         "outcome": {
-            "status":           outcome_status,
-            "total_steps":      len(steps),
+            "status": outcome_status,
+            "total_steps": len(steps),
             "total_tool_calls": len(tool_calls_made),
-            "tools_used":       list(set(tool_calls_made)),
+            "tools_used": list(set(tool_calls_made)),
             "failure_occurred": outcome_status != "success",
-            "failure_reason":   failure_reason,
-            "final_answer":     final_answer,
+            "failure_reason": failure_reason,
+            "final_answer": final_answer,
             "duration_seconds": duration_s,
+            "execution_grounded": False,
+            "files_changed": [],
+            "validation_commands": [],
+            "command_history": [],
         },
         "metadata": {
-            "agent_framework":         "react",
-            "agent_model":             {
-                "agent":        "groq/llama-3.3-70b-versatile",
+            "agent_framework": "react",
+            "agent_model": {
+                "agent": "groq/llama-3.3-70b-versatile",
                 "agent_backup": "groq/openai-gpt-oss-120b",
             }.get(model_role, "groq/llama-3.3-70b-versatile"),
-            "agent_temperature":       temp,
+            "agent_temperature": temp,
             "prompt_template_version": PROMPT_TEMPLATE_VERSION,
-            "token_count_input":       int(input_tokens),
-            "token_count_output":      int(output_tokens),
-            "world_context_date":      datetime.now().strftime("%Y-%m-%d"),
-            "schema_version":          "v3.0",
-        }
+            "token_count_input": int(input_tokens),
+            "token_count_output": int(output_tokens),
+            "world_context_date": datetime.now().strftime("%Y-%m-%d"),
+            "schema_version": "v4.0",
+        },
     }
+
+
+def run_agent_on_task(task: dict, force_success: bool = False) -> dict:
+    if task.get("execution_target") == "real_repo_issue":
+        return _run_real_repo_task(task)
+    return _run_synthetic_task(task, force_success=force_success)
 
 
 def execute_tasks(tasks: list[dict]) -> list[dict]:
     from task_generator import mark_executed
-    traces   = []
-    total    = len(tasks)
-    n_success = max(1, int(total * 0.4))
-    success_indices = set(random.sample(range(total), min(n_success, total)))
 
-    print(f"\n🤖 Executing {total} tasks ({len(success_indices)} forced-success)...")
-    print("  ⏳ Waiting 60s for rate limit window reset...")
-    time.sleep(60)
+    traces = []
+    total = len(tasks)
+    synthetic_indices = [
+        i for i, task in enumerate(tasks)
+        if task.get("execution_target") != "real_repo_issue"
+    ]
+    n_success = max(1, int(len(synthetic_indices) * 0.4)) if synthetic_indices else 0
+    success_indices = set(random.sample(synthetic_indices, min(n_success, len(synthetic_indices)))) if synthetic_indices else set()
 
+    print(f"\n🤖 Executing {total} tasks...")
     for i, task in enumerate(tasks, 1):
-        print(f"  [{i}/{total}] {task['task'][:70]}...")
+        task_mode = task.get("execution_target", "synthetic")
+        print(f"  [{i}/{total}] ({task_mode}) {task['task'][:70]}...")
         try:
             trace = run_agent_on_task(task, force_success=(i - 1) in success_indices)
             traces.append(trace)

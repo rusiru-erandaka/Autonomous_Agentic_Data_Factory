@@ -45,6 +45,9 @@ def validate_schema(record: dict) -> tuple[bool, str]:
 
 def validate_labels(record: dict) -> tuple[bool, str]:
     scores = record["labels"]["trace_level_scores"]
+    task = record.get("task", {})
+    outcome = record.get("outcome", {})
+    execution_target = task.get("execution_target", "synthetic")
 
     # reward_computed must exist and not be None
     rc = scores.get("reward_computed")
@@ -69,12 +72,30 @@ def validate_labels(record: dict) -> tuple[bool, str]:
         return False, "Identical fallback scores — labeler likely failed silently"
 
     # Validate: failed outcome must not have task_completion > 0
-    outcome = record.get("outcome", {}).get("status", "")
-    if outcome == "failed" and tc > 0:
+    outcome_status = outcome.get("status", "")
+    if outcome_status == "failed" and tc > 0:
         scores["task_completion"]     = 0
         scores["reward_signal"]       = 0.0
         scores["reward_computed"]     = 0.0
         record["labels"]["trace_level_scores"] = scores
+
+    verdict = scores.get("supervisor_verdict", "flag")
+    files_changed = outcome.get("files_changed", []) or []
+    execution_grounded = bool(outcome.get("execution_grounded", False))
+    total_tools = int(outcome.get("total_tool_calls", 0) or 0)
+
+    if outcome_status == "failed" and verdict == "approve":
+        return False, "failed outcome cannot be approve"
+
+    if execution_target == "real_repo_issue":
+        if not execution_grounded:
+            return False, "real repo issue trace is not execution-grounded"
+        if total_tools == 0 and not files_changed:
+            return False, "real repo issue has no grounded progress evidence"
+        if outcome_status == "success" and not files_changed:
+            return False, "real repo issue success without file changes"
+        if verdict == "approve" and not files_changed:
+            return False, "approve verdict requires file-change evidence for real repo issues"
 
     return True, "ok"
 

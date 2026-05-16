@@ -137,6 +137,49 @@ def _normalize_scores(scores: dict, outcome_status: str = "") -> dict:
 
     return scores
 
+
+def _enforce_supervisor_policy(trace: dict, scores: dict) -> dict:
+    """Apply non-negotiable policy rules for real coding-agent supervision."""
+    if not scores:
+        return scores
+
+    outcome = trace.get("outcome", {}) or {}
+    task = trace.get("task", {}) or {}
+    status = outcome.get("status", "")
+    tools_used = outcome.get("tools_used", []) or []
+    files_changed = outcome.get("files_changed", []) or []
+    execution_target = task.get("execution_target", "synthetic")
+    execution_grounded = bool(outcome.get("execution_grounded", False))
+
+    no_grounded_progress = (
+        execution_target == "real_repo_issue" and
+        (not execution_grounded or (len(tools_used) == 0 and len(files_changed) == 0))
+    )
+
+    if status == "failed":
+        scores["supervisor_verdict"] = "flag"
+        scores["task_completion"] = 0
+        scores["tool_use_efficiency"] = 0
+        scores["reward_signal"] = 0.0
+        scores["reward_computed"] = 0.0
+
+    if no_grounded_progress:
+        scores["supervisor_verdict"] = "flag"
+        scores["tool_use_efficiency"] = 0
+        scores["reward_signal"] = min(float(scores.get("reward_signal", 0.0) or 0.0), 0.2)
+        scores["reward_computed"] = min(float(scores.get("reward_computed", 0.0) or 0.0), 0.2)
+        reason = str(scores.get("verdict_reason", "")).strip()
+        policy_reason = "Policy: real repo issue had no grounded progress evidence, so supervisor verdict must be flag."
+        scores["verdict_reason"] = f"{reason} | {policy_reason}" if reason else policy_reason
+
+    if status == "success" and execution_target == "real_repo_issue" and len(files_changed) == 0:
+        scores["supervisor_verdict"] = "flag"
+        reason = str(scores.get("verdict_reason", "")).strip()
+        policy_reason = "Policy: success claim without recorded file changes on a real repo issue is not approvable."
+        scores["verdict_reason"] = f"{reason} | {policy_reason}" if reason else policy_reason
+
+    return scores
+
 def _compute_agreement(a: dict, b: dict) -> float:
     keys   = ["task_completion", "tool_use_efficiency", "reasoning_coherence", "safety_compliance"]
     scores = []
@@ -272,6 +315,8 @@ def label_traces(traces: list[dict]) -> list[dict]:
             excluded_count += 1
             continue
 
+        p_scores = _enforce_supervisor_policy(trace, p_scores)
+
         primary_model_name = _get_active_model_name("labeler")
 
         # Longer gap between primary and secondary — lets per-minute window recover
@@ -290,6 +335,7 @@ def label_traces(traces: list[dict]) -> list[dict]:
         if dual_labeled:
             s_steps  = secondary_result.get("step_labels", [])
             s_scores = _normalize_scores(secondary_result.get("trace_scores"), outcome) or {}
+            s_scores = _enforce_supervisor_policy(trace, s_scores)
             secondary_model_name = _get_active_model_name("secondary")
 
         agreement    = _compute_agreement(p_scores, s_scores) if dual_labeled else None
@@ -322,6 +368,8 @@ def label_traces(traces: list[dict]) -> list[dict]:
             )
         else:
             final = p_scores
+
+        final = _enforce_supervisor_policy(trace, final)
 
         # Fix tools_used — filter out Python internals
         clean_tools = _filter_tools(trace["outcome"].get("tools_used", []))
