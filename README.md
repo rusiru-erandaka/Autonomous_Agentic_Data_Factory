@@ -1,128 +1,256 @@
-# 🤖 AI Agent Behavior Dataset — Automated Pipeline
+# AI Coding Supervisor Dataset Pipeline
 
-A fully automated, continuously updating dataset for training **AI agent supervisors, evaluators, and reward models**.
+An automated pipeline for generating training data for **coding-agent supervisor models**.
 
-**Niche:** API Orchestration + Code Agent tasks  
-**Updates:** Daily via GitHub Actions  
-**Labeler:** Nvidia Nemotron-3-Super-120B with constitutional rubric  
-**Dataset:** Published on HuggingFace — anyone can use it
+The current direction of the project is:
+- harvest real GitHub issues
+- turn them into repo-grounded coding tasks
+- run agents against cloned repositories
+- capture execution evidence and traces
+- label the traces with supervisor-style judgments and scalar rewards
+- publish filtered rows to Hugging Face
 
----
+This repository is still in transition from a mostly synthetic pipeline to a grounded repo-execution pipeline. The code reflects that mixed state.
 
-## Pipeline Architecture
+## Current Status
 
+What is already implemented:
+- GitHub issue harvesting with executable-issue scoring
+- repo/issue provenance carried through task generation and export
+- real repo workspace preparation for grounded tasks
+- command-history capture for repo-grounded attempts
+- dual labeling with merged supervisor scores
+- deterministic exported `reward_signal`, `reward_computed`, and `overall_quality`
+- conflict detection with `conflict_dimensions`
+
+What is still in progress:
+- autonomous patch authoring inside cloned repos
+- stronger grounded success rates for repo-based tasks
+- broader safety-score variation
+- reducing dependence on synthetic template tasks
+
+## Pipeline Flow
+
+```text
+Real-World Signals
+  GitHub issues (primary)
+  Optional other sources
+        |
+        v
+Task Generation
+  template tasks
+  repo-grounded GitHub issue tasks
+  mutation tasks
+        |
+        v
+Execution
+  synthetic tasks -> mocked executor
+  real_repo_issue tasks -> clone repo, inspect files, capture commands
+        |
+        v
+Labeling
+  primary + secondary LLM review
+  merged scalar scores
+  step-level labels
+  conflict detection
+        |
+        v
+Quality Gate
+  schema validation
+  verdict / reward consistency checks
+  grounded-trace checks
+  drift detection
+        |
+        v
+Hugging Face Export
+  flattened rows
+  local backup
+  dataset push
 ```
-Real-World Signals (GitHub / StackOverflow / HF Papers / API Changelogs)
-        │
-        ▼
-Task Generator (3 strategies: template / LLM-generative / mutation)
-        │
-        ▼
-Agent Executor (Llama-3.3-70B ReAct agent, full trace capture)
-        │
-        ▼
-Nemotron Labeler (constitutional rubric, dual-check on 10%)
-        │
-        ▼
-Quality Gate (schema + label + drift validation)
-        │
-        ▼
-HuggingFace Dataset (daily append + version history)
-```
-
----
 
 ## Project Structure
 
-```
-pipeline/
-├── main.py                    # orchestrator — run this
-├── openrouter_client.py       # unified LLM client (OpenRouter free models)
-├── task_sources.py            # GitHub / SO / HF / changelog scrapers
-├── task_generator.py          # 3-strategy task engine + SQLite registry
-├── agent_executor.py          # ReAct agent runner + trace capture
-├── labeler.py                 # Nemotron constitutional labeling
-├── quality_gate.py            # validation + drift detection
-├── hf_uploader.py             # HuggingFace push
-├── requirements.txt
-└── registry/                  # auto-created, stores SQLite DB + run logs
-
-.github/
-└── workflows/
-    └── daily_pipeline.yml     # GitHub Actions — runs every day at 2am UTC
+```text
+main.py               orchestrator
+task_sources.py       signal collection, mainly GitHub issue harvesting
+task_generator.py     task conversion, registry storage, mutation
+agent_executor.py     synthetic executor + grounded repo runner
+labeler.py            dual labeling, merge policy, conflict detection
+quality_gate.py       validation and drift checks
+hf_uploader.py        row flattening and Hugging Face upload
+llm_client.py         Groq-first LLM client with fallback handling
+openrouter_client.py  older fallback client, not the primary path now
+requirements.txt
+daily_pipeline.yml    GitHub Actions workflow
+registry/             generated DBs, logs, backups, workspaces
+SECURITY.md           security policy
 ```
 
----
+## Execution Modes
+
+### Synthetic Tasks
+
+Template-style tasks still exist to keep the pipeline producing stable baseline rows.
+
+Characteristics:
+- faster
+- easier to label
+- useful as clean anchors
+- not repository-grounded
+
+### Repo-Grounded Tasks
+
+GitHub issue tasks now carry:
+- `repo_url`
+- `repo_clone_url`
+- `repo_full_name`
+- `issue_number`
+- `issue_title`
+- `issue_labels`
+- `path_hints`
+- `execution_target=real_repo_issue`
+
+Current grounded execution does:
+- clone the target repository into `registry/execution_workspace`
+- inspect files and search likely paths
+- record command history and repo metadata
+- emit honest `failed` / `partial` traces when no patch is applied
+
+It does **not** yet fully implement autonomous patch writing and validation loops. That is the next major implementation step.
 
 ## Setup
 
-### 1. Clone and install
+### 1. Install dependencies
 
 ```bash
-git clone https://github.com/your-username/agent-behavior-dataset-pipeline
-cd agent-behavior-dataset-pipeline
-pip install -r pipeline/requirements.txt
+pip install -r requirements.txt
 ```
 
-### 2. Set environment variables
+### 2. Configure environment variables
+
+Create a `.env` file in the repo root.
+
+Minimum useful settings:
 
 ```bash
-export OPENROUTER_API_KEY="sk-or-..."
-export HF_TOKEN="hf_..."
-export GITHUB_TOKEN="ghp_..."          # optional but recommended
-export HF_DATASET_REPO="your-username/agent-behavior-dataset"
+GROQ_API_KEY=...
+HF_TOKEN=...
+HF_DATASET_REPO=your-username/your-dataset
+GITHUB_TOKEN=ghp_...
+RUN_ONCE=true
+DAILY_TASK_TARGET=4
 ```
 
-### 3. Run once locally to test
+Useful optional settings:
 
 ```bash
-cd pipeline
-RUN_ONCE=true DAILY_TASK_TARGET=5 python main.py
+GITHUB_ONLY_SIGNALS=true
+GITHUB_TIMEOUT_SECONDS=25
+MIN_GITHUB_ISSUE_SCORE=5
+KEEP_EXECUTION_WORKSPACES=false
+SCHEDULE_TIME=02:00
 ```
 
-### 4. Set up GitHub Actions (for daily automation)
+## Running
 
-In your GitHub repo:
-- Go to **Settings → Secrets → Actions**
-- Add: `OPENROUTER_API_KEY`, `HF_TOKEN`, `GH_PAT`
-- Go to **Settings → Variables → Actions**
-- Add: `HF_DATASET_REPO` = `your-username/agent-behavior-dataset`
+### Run once locally
 
-That's it — it runs every night at 2am UTC automatically.
+```bash
+RUN_ONCE=true DAILY_TASK_TARGET=4 python main.py
+```
 
----
+### Scheduled mode
 
-## Models Used (all free via OpenRouter)
+```bash
+python main.py
+```
 
-| Role | Model |
-|---|---|
-| Agent Executor | `meta-llama/llama-3.3-70b-instruct:free` |
-| Agent Backup | `openai/gpt-oss-120b:free` |
-| Primary Labeler | `nvidia/nemotron-3-super-120b-a12b:free` |
-| Secondary Labeler | `qwen/qwen3-next-80b-a3b-instruct:free` |
-| Task Generator | `nvidia/nemotron-3-nano-30b-a3b:free` |
-| Quality Gate | `google/gemma-4-31b-it:free` |
+This starts the scheduler and also runs immediately on startup.
 
----
+## Model Routing
 
-## Dataset Schema
+The live pipeline is **Groq-first**, with fallback support handled in `llm_client.py`.
 
-Each record contains:
+Current role intent:
+- `generator`: fast task conversion
+- `agent`: primary execution reasoning
+- `agent_backup`: alternate execution model
+- `labeler`: primary supervisor labeler
+- `secondary`: independent secondary labeler
+- `quality_gate`: reserved lightweight role
 
-| Field | Description |
-|---|---|
-| `task` | The agent task instruction |
-| `task_difficulty` | simple / medium / complex |
-| `trace_json` | Full step-by-step agent execution trace |
-| `outcome_status` | success / partial / failed |
-| `reward_signal` | 0.0–1.0 reward score from Nemotron |
-| `supervisor_verdict` | approve / flag / reject |
-| `step_level_scores` | Per-step labels with rationale |
-| `world_context_date` | Date task was grounded in real-world context |
-| `constitution_version` | Labeling rubric version for consistency |
+Do not rely on the old README-era assumption that the project is OpenRouter-first or Nemotron-only. That is no longer accurate.
 
----
+## Dataset Row Shape
+
+Exported rows now include both classic synthetic fields and newer grounded-execution fields.
+
+Core fields:
+- `task`
+- `task_difficulty`
+- `trace_json`
+- `outcome_status`
+- `reward_signal`
+- `reward_computed`
+- `overall_quality`
+- `supervisor_verdict`
+- `verdict_reason`
+- `step_level_scores`
+
+Grounded execution fields:
+- `source_url`
+- `repo_url`
+- `repo_clone_url`
+- `repo_full_name`
+- `repo_default_branch`
+- `repo_language`
+- `issue_number`
+- `issue_title`
+- `issue_labels`
+- `path_hints`
+- `execution_target`
+- `execution_grounded`
+- `files_changed`
+- `validation_commands`
+- `command_history`
+
+Label merge / audit fields:
+- `labeler_model`
+- `labeler_model_2`
+- `agreement_score`
+- `conflict_flag`
+- `conflict_dimensions`
+- `merge_strategy`
+- `reward_adjustment_reason`
+- `quality_formula`
+- `reward_formula`
+- `rubric_hash`
+
+## Known Limitations
+
+- Many successful rows are still synthetic.
+- Grounded repo runs currently produce more honest failures than successful fixes.
+- Safety-score diversity is still weaker than it should be.
+- The secondary labeler path should continue to be strengthened.
+- `openrouter_client.py` remains in the repo, but it is not the main execution path.
+
+## GitHub Actions
+
+`daily_pipeline.yml` can be used for scheduled runs.
+
+Recommended secrets / variables:
+- `GROQ_API_KEY`
+- `HF_TOKEN`
+- `GH_PAT`
+- `OPENROUTER_API_KEY_1`
+- `OPENROUTER_API_KEY_2`
+- `OPENROUTER_API_KEY_3`
+- `HF_DATASET_REPO`
+
+## Security
+
+See [SECURITY.md](./SECURITY.md).
 
 ## License
 
-Dataset: Apache 2.0 — free to use for research and commercial training.
+Use your intended repository and dataset license here if you have not finalized it yet. The previous README’s licensing statement should not be treated as authoritative unless you explicitly confirm it.
