@@ -95,6 +95,7 @@ def flatten_record(record: dict) -> dict:
         "repo_language": record["task"].get("repo_language", ""),
         "issue_number": record["task"].get("issue_number"),
         "issue_title": record["task"].get("issue_title", ""),
+        "issue_body": record["task"].get("issue_body", ""),
         "issue_labels": json.dumps(record["task"].get("issue_labels", [])),
         "path_hints": json.dumps(record["task"].get("path_hints", [])),
         "execution_target": record["task"].get("execution_target", "synthetic"),

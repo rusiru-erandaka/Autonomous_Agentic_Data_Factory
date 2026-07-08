@@ -190,6 +190,7 @@ def _build_issue_signal(repo: str, issue: dict, repo_meta: dict) -> dict | None:
         "raw_text": text,
         "title": title,
         "body": body,
+        "issue_body": body,
         "source": source,
         "source_url": issue.get("html_url", ""),
         "date": issue.get("created_at", "")[:10],

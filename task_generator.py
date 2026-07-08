@@ -89,6 +89,7 @@ def _issue_task_metadata(signal: dict) -> dict:
         "repo_language": signal.get("repo_language", ""),
         "issue_number": signal.get("issue_number"),
         "issue_title": signal.get("title", ""),
+        "issue_body": signal.get("issue_body", signal.get("body", signal.get("raw_text", ""))),
         "issue_labels": signal.get("issue_labels", []),
         "path_hints": signal.get("path_hints", []),
         "execution_target": signal.get("execution_target", "synthetic"),
@@ -108,6 +109,7 @@ def _merge_task_metadata(task: dict, signal: Optional[dict] = None) -> dict:
     merged.setdefault("repo_language", "")
     merged.setdefault("issue_number", None)
     merged.setdefault("issue_title", merged.get("task", ""))
+    merged.setdefault("issue_body", merged.get("issue_title", merged.get("task", "")))
     merged.setdefault("issue_labels", [])
     merged.setdefault("path_hints", [])
     merged.setdefault("execution_target", "synthetic")
@@ -246,6 +248,7 @@ def mutate_task_rule_based(seed: dict) -> dict:
         "repo_language": seed.get("repo_language", ""),
         "issue_number": seed.get("issue_number"),
         "issue_title": seed.get("issue_title", ""),
+        "issue_body": seed.get("issue_body", ""),
         "issue_labels": seed.get("issue_labels", []),
         "path_hints": seed.get("path_hints", []),
     }
@@ -272,6 +275,7 @@ def init_registry():
             repo_language TEXT,
             issue_number INTEGER,
             issue_title TEXT,
+            issue_body TEXT,
             issue_labels TEXT,
             path_hints TEXT,
             execution_target TEXT,
@@ -294,6 +298,7 @@ def init_registry():
         "repo_language": "TEXT",
         "issue_number": "INTEGER",
         "issue_title": "TEXT",
+        "issue_body": "TEXT",
         "issue_labels": "TEXT",
         "path_hints": "TEXT",
         "execution_target": "TEXT",
@@ -340,9 +345,9 @@ def save_task(task: dict) -> bool:
                 task_id, task, difficulty, expected_tools, failure_points,
                 generation_strategy, freshness_source, source_url, repo_url,
                 repo_clone_url, repo_full_name, repo_default_branch, repo_language,
-                issue_number, issue_title, issue_labels, path_hints,
+                issue_number, issue_title, issue_body, issue_labels, path_hints,
                 execution_target, task_type, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             fp,
             task["task"],
@@ -359,6 +364,7 @@ def save_task(task: dict) -> bool:
             task.get("repo_language", ""),
             task.get("issue_number"),
             task.get("issue_title", ""),
+            task.get("issue_body", ""),
             json.dumps(task.get("issue_labels", [])),
             json.dumps(task.get("path_hints", [])),
             task.get("execution_target", "synthetic"),
@@ -380,7 +386,7 @@ def load_approved_tasks(limit: int = 100) -> list[dict]:
             task_id, task, difficulty, expected_tools, failure_points,
             freshness_source, created_at, source_url, repo_url, repo_clone_url,
             repo_full_name, repo_default_branch, repo_language, issue_number,
-            issue_title, issue_labels, path_hints, execution_target, task_type
+            issue_title, issue_body, issue_labels, path_hints, execution_target, task_type
         FROM tasks
         WHERE status = 'approved'
         ORDER BY executed_count ASC, created_at DESC
@@ -406,10 +412,11 @@ def load_approved_tasks(limit: int = 100) -> list[dict]:
             "repo_language": row[12] or "",
             "issue_number": row[13],
             "issue_title": row[14] or "",
-            "issue_labels": json.loads(row[15] or "[]"),
-            "path_hints": json.loads(row[16] or "[]"),
-            "execution_target": row[17] or "synthetic",
-            "task_type": row[18] or "generic_task",
+            "issue_body": row[15] or row[14] or row[1],
+            "issue_labels": json.loads(row[16] or "[]"),
+            "path_hints": json.loads(row[17] or "[]"),
+            "execution_target": row[18] or "synthetic",
+            "task_type": row[19] or "generic_task",
         })
     return tasks
 
@@ -430,7 +437,7 @@ def get_registry_sample(n: int = 5) -> list[dict]:
         SELECT
             task, difficulty, expected_tools, failure_points, source_url, repo_url,
             repo_clone_url, repo_full_name, repo_default_branch, repo_language,
-            issue_number, issue_title, issue_labels, path_hints,
+            issue_number, issue_title, issue_body, issue_labels, path_hints,
             execution_target, task_type
         FROM tasks
         ORDER BY RANDOM()
@@ -450,10 +457,11 @@ def get_registry_sample(n: int = 5) -> list[dict]:
         "repo_language": row[9] or "",
         "issue_number": row[10],
         "issue_title": row[11] or "",
-        "issue_labels": json.loads(row[12] or "[]"),
-        "path_hints": json.loads(row[13] or "[]"),
-        "execution_target": row[14] or "synthetic",
-        "task_type": row[15] or "generic_task",
+        "issue_body": row[12] or row[11] or row[0],
+        "issue_labels": json.loads(row[13] or "[]"),
+        "path_hints": json.loads(row[14] or "[]"),
+        "execution_target": row[15] or "synthetic",
+        "task_type": row[16] or "generic_task",
     } for row in rows]
 
 
