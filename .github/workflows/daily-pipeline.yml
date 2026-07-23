@@ -1,0 +1,91 @@
+name: Daily Supervisor Dataset Pipeline
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      task_target:
+        description: Maximum number of tasks to process
+        required: false
+        default: "12"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: supervisor-dataset-pipeline
+  cancel-in-progress: false
+
+jobs:
+  generate-dataset:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    env:
+      PYTHONUNBUFFERED: "1"
+      RUN_ONCE: "true"
+      DAILY_TASK_TARGET: ${{ inputs.task_target || '12' }}
+      GITHUB_ONLY_SIGNALS: "true"
+      KEEP_EXECUTION_WORKSPACES: "false"
+      REAL_REPO_EXECUTION_MODE: "react_grounded"
+
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      OPENROUTER_API_KEY_1: ${{ secrets.OPENROUTER_API_KEY_1 }}
+      OPENROUTER_API_KEY_2: ${{ secrets.OPENROUTER_API_KEY_2 }}
+      OPENROUTER_API_KEY_3: ${{ secrets.OPENROUTER_API_KEY_3 }}
+      GITHUB_TOKEN: ${{ secrets.GH_PAT || github.token }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_DATASET_REPO: ${{ vars.HF_DATASET_REPO }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Restore pipeline registry
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            registry/tasks.db
+            registry/seen_signals.db
+            registry/baseline_scores.json
+          key: pipeline-registry-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            pipeline-registry-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Prepare registry directory
+        run: mkdir -p registry
+
+      - name: Run dataset pipeline
+        run: python main.py
+
+      - name: Save pipeline registry
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            registry/tasks.db
+            registry/seen_signals.db
+            registry/baseline_scores.json
+          key: pipeline-registry-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Upload run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dataset-pipeline-${{ github.run_number }}-${{ github.run_attempt }}
+          path: |
+            registry/run_*.json
+            registry/batch_*.jsonl
+          if-no-files-found: warn
+          retention-days: 30
