@@ -64,8 +64,9 @@ Quality Gate
         v
 Hugging Face Export
   flattened rows
-  local backup
-  dataset push
+  registry backup
+  tracked data/ JSONL batch
+  Hugging Face dataset push
 ```
 
 ## Project Structure
@@ -81,7 +82,9 @@ hf_uploader.py        row flattening and Hugging Face upload
 llm_client.py         Groq-first LLM client with fallback handling
 openrouter_client.py  older fallback client, not the primary path now
 requirements.txt
-daily_pipeline.yml    GitHub Actions workflow
+.github/workflows/
+  daily-pipeline.yml  active scheduled GitHub Actions workflow
+data/                 tracked flattened JSONL dataset batches
 registry/             generated DBs, logs, backups, workspaces
 SECURITY.md           security policy
 ```
@@ -236,7 +239,10 @@ Label merge / audit fields:
 
 ## GitHub Actions
 
-`daily_pipeline.yml` can be used for scheduled runs.
+`.github/workflows/daily-pipeline.yml` runs daily at 02:00 UTC and can also be
+started manually. After a quality-gated run, it commits the new flattened JSONL
+batch under `data/` and pushes the same rows to the configured Hugging Face
+dataset. The workflow preserves registry databases through the Actions cache.
 
 Recommended secrets / variables:
 - `GROQ_API_KEY`
@@ -246,6 +252,10 @@ Recommended secrets / variables:
 - `OPENROUTER_API_KEY_2`
 - `OPENROUTER_API_KEY_3`
 - `HF_DATASET_REPO`
+
+The workflow requires `contents: write` permission so the GitHub Actions bot can
+commit generated batches. Repository or organization policies must also permit
+GitHub Actions to create commits.
 
 ## Security
 
