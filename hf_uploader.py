@@ -10,6 +10,8 @@ from datetime import datetime
 
 import pandas as pd
 
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+
 
 def _get_hf_token() -> str:
     return os.environ.get("HF_TOKEN", "").strip()
@@ -174,8 +176,30 @@ def make_splits(df: pd.DataFrame) -> dict:
         return {"train": df}
 
 
+def save_github_data_copy(
+    rows: list[dict],
+    output_dir: str | None = None,
+    batch_id: str | None = None,
+) -> str:
+    """Save the flattened Hugging Face rows as a tracked JSONL batch."""
+    if not rows:
+        return ""
+
+    target_dir = output_dir or DATA_DIR
+    batch_name = batch_id or datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    os.makedirs(target_dir, exist_ok=True)
+    output_path = os.path.join(target_dir, f"batch_{batch_name}.jsonl")
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+
+    print(f"  GitHub data copy: {output_path}")
+    return output_path
+
+
 def push_to_hf(records: list[dict]):
-    """Flatten, append to existing dataset, split, and push to HuggingFace."""
+    """Save flattened rows locally, then append and push them to Hugging Face."""
     if not records:
         print("  ⚠️  No records to push.")
         return
@@ -192,6 +216,8 @@ def push_to_hf(records: list[dict]):
             print(f"  ⚠️  Could not flatten record {i}: {e}")
     df_new = pd.DataFrame(rows)
     print(f"  Prepared {len(df_new)} rows.")
+
+    save_github_data_copy(rows)
 
     os.makedirs("registry", exist_ok=True)
     backup_path = f"registry/batch_{today}.jsonl"

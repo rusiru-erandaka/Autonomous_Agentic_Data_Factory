@@ -203,6 +203,7 @@ Key exported groups:
 
 The uploader also:
 - writes a local JSONL backup into `registry/`
+- writes the same flattened Hugging Face rows into timestamped `data/` batches
 - appends to an existing HF dataset if configured
 - creates train/validation/test splits when enough rows exist
 
@@ -243,17 +244,12 @@ Be careful with changes that delete or invalidate this state.
 
 ## Scheduler and CI Notes
 
-There is a `daily_pipeline.yml` file in the repo root that describes the daily
-pipeline workflow.
+The active workflow is `.github/workflows/daily-pipeline.yml`.
 
-Important caveat:
-- GitHub Actions only loads workflows from `.github/workflows/`
-- the repo currently has a workflow there for code review, not this daily
-  pipeline
-
-So if your task is "make the scheduled pipeline actually run in GitHub
-Actions", moving or recreating that workflow under `.github/workflows/` is part
-of the work.
+It runs the pipeline on a daily schedule or manual dispatch, caches the task and
+signal registries, uploads run artifacts, and commits generated flattened JSONL
+batches under `data/`. The root `daily_pipeline.yml` is a legacy reference and
+is not loaded by GitHub Actions.
 
 ## Local Run Expectations
 
@@ -318,7 +314,6 @@ If you are asked to improve the project, the highest-value areas are usually:
 - Linux-safe grounded execution commands
 - stronger validation command selection
 - reducing synthetic dependence
-- making the daily workflow actually active in GitHub Actions
 - improving observability around why grounded traces pass or fail
 
 ## Working Rule

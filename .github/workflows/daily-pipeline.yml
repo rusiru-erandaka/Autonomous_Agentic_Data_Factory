@@ -12,7 +12,7 @@ on:
         type: string
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: supervisor-dataset-pipeline
@@ -68,6 +68,27 @@ jobs:
 
       - name: Run dataset pipeline
         run: python main.py
+
+      - name: Commit generated dataset batch
+        if: success()
+        shell: bash
+        run: |
+          if [[ ! -d data ]]; then
+            echo "No data directory was generated."
+            exit 0
+          fi
+
+          git add --all -- data
+          if git diff --cached --quiet; then
+            echo "No new dataset samples to commit."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "data: add samples from pipeline run ${{ github.run_number }}"
+          git pull --rebase origin "$GITHUB_REF_NAME"
+          git push origin "HEAD:$GITHUB_REF_NAME"
 
       - name: Save pipeline registry
         if: always()
