@@ -1,6 +1,6 @@
 """
 labeler.py
-Labels traces: Google Gemini (primary, KEY: GOOGLE_API_KEY) + Groq Qwen (secondary).
+Labels traces with Groq Llama 70B (primary) and Groq Qwen3 32B (secondary).
 
 Critical fixes:
 - Retry up to 3 times with backoff before giving up on a trace
@@ -409,7 +409,7 @@ def label_traces(traces: list[dict]) -> list[dict]:
     excluded_count   = 0
     total            = len(traces)
 
-    print(f"\n🏷️  Labeling {total} traces (primary=LLaMA-70B, secondary=LLaMA-8B instant)...")
+    print(f"\n🏷️  Labeling {total} traces (primary=LLaMA-70B, secondary=Qwen3-32B)...")
     print("  ⏳ Waiting 75s for rate limit windows to reset...")
     time.sleep(75)
 
@@ -420,7 +420,7 @@ def label_traces(traces: list[dict]) -> list[dict]:
 
         prompt = _build_prompt(trace)
 
-        # ── Primary labeler (Google Gemini → GOOGLE_API_KEY) ───────────────────
+        # ── Primary labeler (Groq Llama 70B) ───────────────────────────────────
         primary_result = _call_with_retry("labeler", prompt, retries=LABELING_MAX_RETRIES)
 
         if primary_result is None:
@@ -444,8 +444,7 @@ def label_traces(traces: list[dict]) -> list[dict]:
         # Longer gap between primary and secondary — lets per-minute window recover
         time.sleep(15)
 
-        # ── Secondary labeler (Groq LLaMA 8B → GROQ_API_KEY) ──────────────────
-        # Uses llama-3.1-8b-instant (14.4K RPD) — no daily limit issues
+        # ── Secondary labeler (Groq Qwen3 32B) ─────────────────────────────────
         # Only 1 retry — 429s are already handled inside call_llm with 65s wait
         secondary_result = _call_with_retry("secondary", prompt, retries=1)
         dual_labeled     = secondary_result is not None

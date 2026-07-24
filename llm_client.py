@@ -17,11 +17,11 @@ Groq free limits:
 
 Role pools — tried top to bottom on failure:
   generator    → 8b-instant (14.4K RPD, fast)
-  agent        → 70b-versatile (strongest reasoning)
-  agent_backup → gpt-oss-120b (different architecture)
+  agent        → gpt-oss-120b (strongest coding baseline)
+  agent_backup → 70b-versatile (execution fallback)
   labeler      → 70b-versatile (strong evaluation)
   secondary    → qwen3-32b (60 RPM, different model for diversity)
-  quality_gate → 8b-instant (lightweight)
+  quality_gate → qwen3-32b (60 RPM syntax/bug-checking role)
 """
 
 import os
@@ -47,17 +47,17 @@ ROLE_CONFIG = {
     "agent": {
         "provider": "groq",
         "models": [
+            "openai/gpt-oss-120b",
             "llama-3.3-70b-versatile",
             "meta-llama/llama-4-scout-17b-16e-instruct",
-            "openai/gpt-oss-120b",
         ],
         "rpm": 30,
     },
     "agent_backup": {
         "provider": "groq",
         "models": [
-            "openai/gpt-oss-120b",
             "llama-3.3-70b-versatile",
+            "openai/gpt-oss-120b",
             "meta-llama/llama-4-scout-17b-16e-instruct",
         ],
         "rpm": 30,
@@ -74,19 +74,20 @@ ROLE_CONFIG = {
     "secondary": {
         "provider": "groq",
         "models": [
-            "llama-3.1-8b-instant",            # 14.4K RPD — never hits daily limit
-            "meta-llama/llama-4-scout-17b-16e-instruct",  # 1K RPD fallback
-            "qwen/qwen3-32b",                  # 1K RPD — last resort only
+            "qwen/qwen3-32b",
+            "meta-llama/llama-4-scout-17b-16e-instruct",
+            "llama-3.1-8b-instant",
         ],
-        "rpm": 30,
+        "rpm": 60,
     },
     "quality_gate": {
         "provider": "groq",
         "models": [
+            "qwen/qwen3-32b",
             "llama-3.1-8b-instant",
             "openai/gpt-oss-20b",
         ],
-        "rpm": 30,
+        "rpm": 60,
     },
 }
 

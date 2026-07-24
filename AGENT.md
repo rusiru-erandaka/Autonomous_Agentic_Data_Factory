@@ -216,12 +216,12 @@ Current routing:
 - OpenRouter is fallback
 
 Role-based pools are configured for:
-- `generator`
-- `agent`
-- `agent_backup`
-- `labeler`
-- `secondary`
-- `quality_gate`
+- `generator`: `llama-3.1-8b-instant`
+- `agent`: `openai/gpt-oss-120b`
+- `agent_backup`: `llama-3.3-70b-versatile`
+- `labeler`: `llama-3.3-70b-versatile`
+- `secondary`: `qwen/qwen3-32b`
+- `quality_gate`: `qwen/qwen3-32b` (configured but not called by the pure-Python gate)
 
 Do not assume older comments about Google-first behavior are accurate. Some
 module docstrings and banners are stale relative to the active routing.
