@@ -25,7 +25,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from llm_client import call_llm
+from llm_client import ROLE_CONFIG, call_llm
 
 PROMPT_TEMPLATE_VERSION = "v4.0"
 EXECUTION_ROOT = Path(__file__).resolve().parent / "registry" / "execution_workspace"
@@ -36,6 +36,14 @@ REAL_REPO_EXECUTION_MODE = os.environ.get("REAL_REPO_EXECUTION_MODE", "react_gro
 
 # Temperature pool for synthetic traces only.
 AGENT_TEMPERATURES = [0.0, 0.2, 0.4, 0.4, 0.6, 0.7]
+
+
+def _primary_model_for_role(role: str) -> str:
+    config = ROLE_CONFIG.get(role, {})
+    models = config.get("models", [])
+    provider = config.get("provider", "unknown")
+    model = models[0] if models else "unknown"
+    return f"{provider}/{model}"
 
 
 def _safe_slug(text: str) -> str:
@@ -425,7 +433,7 @@ def _run_real_repo_task(task: dict) -> dict:
         },
         "metadata": {
             "agent_framework": "repo_runner",
-            "agent_model": "groq/llama-3.3-70b-versatile",
+            "agent_model": _primary_model_for_role("agent"),
             "agent_temperature": 0.0,
             "prompt_template_version": PROMPT_TEMPLATE_VERSION,
             "token_count_input": int(token_in),
@@ -802,10 +810,7 @@ def _run_react_task(task: dict, force_success: bool = False, grounded: bool = Fa
         },
         "metadata": {
             "agent_framework": "react_grounded" if grounded else "react",
-            "agent_model": {
-                "agent": "groq/llama-3.3-70b-versatile",
-                "agent_backup": "groq/openai-gpt-oss-120b",
-            }.get(model_role, "groq/llama-3.3-70b-versatile"),
+            "agent_model": _primary_model_for_role(model_role),
             "agent_temperature": temp,
             "prompt_template_version": PROMPT_TEMPLATE_VERSION,
             "token_count_input": int(input_tokens),

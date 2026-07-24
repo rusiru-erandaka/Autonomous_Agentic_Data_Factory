@@ -146,7 +146,7 @@ def flatten_record(record: dict) -> dict:
         "verdict_reason": verdict_reason,
 
         "agent_framework": meta.get("agent_framework", "react"),
-        "agent_model": meta.get("agent_model", "groq/llama-3.3-70b-versatile"),
+        "agent_model": meta.get("agent_model", "groq/openai/gpt-oss-120b"),
         "agent_temperature": float(meta.get("agent_temperature", 0.4)),
         "prompt_template_version": meta.get("prompt_template_version", "v4.0"),
         "token_count_input": int(meta.get("token_count_input", 0)),

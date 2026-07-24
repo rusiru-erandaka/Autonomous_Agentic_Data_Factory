@@ -175,12 +175,12 @@ This starts the scheduler and also runs immediately on startup.
 The live pipeline is **Groq-first**, with fallback support handled in `llm_client.py`.
 
 Current role intent:
-- `generator`: fast task conversion
-- `agent`: primary execution reasoning
-- `agent_backup`: alternate execution model
-- `labeler`: primary supervisor labeler
-- `secondary`: independent secondary labeler
-- `quality_gate`: reserved lightweight role
+- `generator`: `llama-3.1-8b-instant`
+- `agent`: `openai/gpt-oss-120b`
+- `agent_backup`: `llama-3.3-70b-versatile`
+- `labeler`: `llama-3.3-70b-versatile`
+- `secondary`: `qwen/qwen3-32b`
+- `quality_gate`: `qwen/qwen3-32b` (reserved; the current gate is pure Python)
 
 Do not rely on the old README-era assumption that the project is OpenRouter-first or Nemotron-only. That is no longer accurate.
 
